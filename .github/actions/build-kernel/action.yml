@@ -470,6 +470,32 @@ runs:
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
 
+    - name: Apply BBRv3 backport
+      if: ${{ env.OP_BBR3 == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        export GIT_CEILING_DIRECTORIES="$KERNEL_PLATFORM_FOLDER"
+        bbr3_patch="$KERNEL_PATCHES_FOLDER/common/bbrv3/0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch"
+
+        has_bbr3() {
+          [ -s net/ipv4/tcp_bbr3.c ] && grep -qxF 'config TCP_CONG_BBR3' net/ipv4/Kconfig &&
+            grep -qF '$(CONFIG_TCP_CONG_BBR3)' net/ipv4/Makefile
+        }
+        if ! has_bbr3; then
+          git apply --whitespace=nowarn -C2 -- "$bbr3_patch"
+        fi
+        if ! has_bbr3; then
+          echo "::error::BBRv3 source or Kbuild registration is missing"
+          exit 1
+        fi
+
+        protected_paths="$RUNNER_TEMP/bbr3-protected-paths.txt"
+        git apply --numstat -- "$bbr3_patch" | cut -f3- | sort -u > "$protected_paths"
+        echo "BBR3_PROTECTED_PATHS_FILE=$protected_paths" >> "$GITHUB_ENV"
+        echo "BBRv3 ready before Epicmann24 patches"
+
     - name: 🧩 Apply Epicmann24 SM8750 Patches
       if: ${{ inputs.epicmann_patches == true || inputs.epicmann_patches == 'true' }}
       shell: bash
@@ -495,7 +521,7 @@ runs:
         echo "CONFIG_BBG=y" >> common/arch/arm64/configs/gki_defconfig
         sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
 
-    - name: Apply OnePlus SM8750 Patches (HMBIRD, Module Overlay, Opt, NTSync, BBRv3, DS, Debloat)
+    - name: Apply OnePlus SM8750 Patches (HMBIRD, Module Overlay, Opt, NTSync, DS, Debloat)
       shell: bash
       run: |
         set -euo pipefail
@@ -626,22 +652,6 @@ runs:
 
         if [ "$OP_UNICODE" = "true" ]; then
           apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch" -C2 || true
-        fi
-
-        if [ "$OP_BBR3" = "true" ]; then
-          has_bbr3() {
-            [ -f net/ipv4/tcp_bbr3.c ] && grep -qxF 'config TCP_CONG_BBR3' net/ipv4/Kconfig &&
-              grep -qF '$(CONFIG_TCP_CONG_BBR3)' net/ipv4/Makefile
-          }
-          if ! has_bbr3; then
-            apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/bbrv3/0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch" -C2 || true
-          fi
-          scripts/config --file arch/arm64/configs/gki_defconfig -e TCP_CONG_ADVANCED -e TCP_CONG_BBR
-          if has_bbr3; then
-            scripts/config --file arch/arm64/configs/gki_defconfig -e TCP_CONG_BBR3
-          else
-            echo "::warning::BBRv3 is unavailable on this source tree; using the existing BBR implementation"
-          fi
         fi
 
         if [ "$OP_DS" = "true" ]; then
@@ -783,7 +793,14 @@ runs:
         if [ -n "${NOMOUNT_VERSION:-}" ]; then
           scripts/config --file "$OUT/.config" -e NOMOUNT
         fi
+        if [ "${OP_BBR3:-false}" = "true" ]; then
+          scripts/config --file "$OUT/.config" -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -e TCP_CONG_BBR3
+        fi
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
+        if [ "${OP_BBR3:-false}" = "true" ] && ! grep -qxF 'CONFIG_TCP_CONG_BBR3=y' "$OUT/.config"; then
+          echo "::error::CONFIG_TCP_CONG_BBR3=y is missing from the final kernel config"
+          exit 1
+        fi
         if [ "${OP_SUSFS:-false}" = "true" ] && ! grep -qxF 'CONFIG_KSU_SUSFS=y' "$OUT/.config"; then
           echo "::error::CONFIG_KSU_SUSFS=y is missing from the final kernel config"
           exit 1
@@ -806,6 +823,13 @@ runs:
 
         IMG="$OUT/arch/arm64/boot/Image"
         [ -f "$IMG" ] || { echo "::error::Image not built"; tail -n 80 build.log; exit 1; }
+        if [ "${OP_BBR3:-false}" = "true" ]; then
+          if [ ! -s "$OUT/net/ipv4/tcp_bbr3.o" ]; then
+            echo "::error::BBRv3 object was not built"
+            exit 1
+          fi
+          echo "BBRv3 built into the kernel (CONFIG_TCP_CONG_BBR3=y)"
+        fi
 
         if [ "${{ inputs.enable_kpm }}" = "true" ] && grep -q "^CONFIG_KPM=y" "$OUT/.config"; then
           echo "🔧 Patching Image with SukiSU patch_linux for KPM..."
@@ -883,6 +907,9 @@ runs:
           echo "- **Kernel Uname:** \`${KERNEL_UNAME}\`"
           echo "- **KSU:** \`${{ inputs.ksu_type }} v${KSUVER:-unknown}\` (\`${KSU_COMMIT_SHA:0:8}\`)"
           echo "- **SUSFS:** \`${SUSVER:-none}\`"
+          if [ "${OP_BBR3:-false}" = "true" ]; then
+            echo '- **BBRv3:** built in (`bbr3`)'
+          fi
           if [ -n "${NOMOUNT_VERSION:-}" ]; then
             echo "- **NoMount:** \`${NOMOUNT_VERSION}\`"
           fi

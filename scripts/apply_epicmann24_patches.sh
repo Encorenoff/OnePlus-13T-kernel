@@ -203,6 +203,13 @@ kernel_api_paths=(
   ':(glob)arch/arm64/lib/**/lz4*'
 )
 
+# Keep BBRv3's TCP changes and its Kbuild entries together.
+if [ -n "${BBR3_PROTECTED_PATHS_FILE:-}" ]; then
+  while IFS= read -r path; do
+    kernel_api_paths+=(":(top,literal)$path")
+  done < "$BBR3_PROTECTED_PATHS_FILE"
+fi
+
 applied=0
 already=0
 conflicts=0
@@ -217,7 +224,7 @@ for sha in "${SELECTED_COMMITS[@]}"; do
     echo "  [SKIP-KSU/SUSFS] ${sha:0:8} $subj"
     continue
   fi
-  if ! git -C "$GIT_DIR" diff-tree --root --quiet "$sha" -- "${kernel_api_paths[@]}"; then
+  if ! git -C "$GIT_DIR" diff-tree --root --no-commit-id -r --quiet "$sha" -- "${kernel_api_paths[@]}"; then
     protected=$((protected + 1))
     echo "  [SKIP-KERNEL-API] ${sha:0:8} $subj"
     continue
