@@ -1,0 +1,494 @@
+name: Build OnePlus 13T/13S Kernels
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      op_model:
+        description: 'Устройство (последние исходники OnePlusOSS A16)'
+        required: true
+        type: choice
+        options:
+          - OP13T+OP13S
+          - OP13T
+          - OP13S
+        default: OP13T+OP13S
+      ksu_variant:
+        description: 'Вариант KernelSU (автоподбор последней версии)'
+        required: true
+        type: choice
+        options:
+          - BAKASU
+          - SUKISU_NOVA
+          - KSUN
+          - ALL
+        default: BAKASU
+      ksu_custom_ref:
+        description: 'Свой branch/tag/SHA для KSU (пусто = авто последняя версия)'
+        required: false
+        type: string
+        default: ''
+      susfs_enable:
+        description: 'Включить последний актуальный SUSFS (gki-android15-6.6)'
+        required: true
+        type: boolean
+        default: true
+      susfs_custom_ref:
+        description: 'Свой branch/SHA для SUSFS (пусто = авто последний gki-android15-6.6)'
+        required: false
+        type: string
+        default: ''
+      kernel_uname:
+        description: 'Имя в конце версии ядра (пример: encoren -> 6.6.118-android15-encoren)'
+        required: true
+        type: string
+        default: 'encoren'
+      epicmann_patches:
+        description: 'Интегрировать патчи epicmann24/android_kernel_common_oneplus_sm8750'
+        required: true
+        type: boolean
+        default: true
+      epicmann_branch:
+        description: 'Ветка epicmann24 (пусто = авто default branch)'
+        required: false
+        type: string
+        default: ''
+      epicmann_filter:
+        description: 'Выбор патчей epicmann24: all | charging,thermal,haptics,wakelock,sched,mm,io,net,display | SHA'
+        required: false
+        type: string
+        default: 'all'
+      enable_kpm:
+        description: 'Включить KPM (CONFIG_KPM=y + patch_linux для SukiSU Nova / BakaSU)'
+        required: false
+        type: boolean
+        default: true
+      enable_hmbird:
+        description: 'Патч HMBIRD SCX (Fengchi)'
+        required: false
+        type: boolean
+        default: true
+      enable_opt:
+        description: 'Патчи оптимизации (WildKernels common opt)'
+        required: false
+        type: boolean
+        default: true
+      enable_bbr3:
+        description: 'Патчи BBR + BBRv3'
+        required: false
+        type: boolean
+        default: true
+      enable_bbg:
+        description: 'Патч Baseband Guard (BBG LSM)'
+        required: false
+        type: boolean
+        default: true
+      enable_ntsync:
+        description: 'Патч NTSync'
+        required: false
+        type: boolean
+        default: true
+      enable_ds:
+        description: 'Патчи Droidspaces (SYSVIPC / containers)'
+        required: false
+        type: boolean
+        default: true
+      optimize_level:
+        description: 'Уровень оптимизации компилятора'
+        required: true
+        type: choice
+        options: [O2, O3]
+        default: O2
+      mlgo:
+        description: 'Включить MLGO'
+        required: false
+        type: boolean
+        default: true
+      clean_build:
+        description: 'Чистая сборка (без ccache)'
+        required: false
+        type: boolean
+        default: false
+      make_release:
+        description: 'Создать GitHub Release'
+        required: true
+        type: boolean
+        default: false
+      debug:
+        description: 'Режим отладки'
+        required: false
+        type: boolean
+        default: false
+      mirror_toolchains:
+        description: 'Зеркалировать тулчейны в Release перед сборкой'
+        required: false
+        type: boolean
+        default: false
+      build_timestamp:
+        description: 'Кастомная дата сборки для uname -a (пусто = текущее время UTC)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  set-op-model:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      device_count: ${{ steps.set-matrix.outputs.count }}
+      susfs_hash_android15_6_6: ${{ steps.set-matrix.outputs.susfs_hash_android15_6_6 }}
+      susfs_base_version: ${{ steps.set-matrix.outputs.susfs_base_version }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_HTTP_TIMEOUT: 600
+    steps:
+      - name: 📥 Checkout Code (configs/)
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            configs/
+          sparse-checkout-cone-mode: false
+
+      - name: 🔍 Resolve latest KSU, SUSFS & Generate Matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Matrix & Auto-Version Resolution"
+
+          mapfile -t all_json_files < <(find configs/ -name "*.json" | sort)
+          jq -s '.' "${all_json_files[@]}" > raw_matrix.json
+
+          case "${{ inputs.op_model }}" in
+            OP13T+OP13S) jq_filter='map(select(.model == "OP13T" or .model == "OP13S"))' ;;
+            OP13T)       jq_filter='map(select(.model == "OP13T"))' ;;
+            OP13S)       jq_filter='map(select(.model == "OP13S"))' ;;
+            *)           echo "::error::Unknown model"; exit 1 ;;
+          esac
+
+          jq -c "$jq_filter" raw_matrix.json | jq -c \
+            --arg uname "${{ inputs.kernel_uname }}" \
+            --argjson susfs "${{ inputs.susfs_enable }}" \
+            --argjson hmbird "${{ inputs.enable_hmbird }}" \
+            --argjson opt "${{ inputs.enable_opt }}" \
+            --argjson bbr3 "${{ inputs.enable_bbr3 }}" \
+            --argjson bbg "${{ inputs.enable_bbg }}" \
+            --argjson ntsync "${{ inputs.enable_ntsync }}" \
+            --argjson ds "${{ inputs.enable_ds }}" \
+            'map(. + {
+              uname: $uname,
+              susfs: $susfs,
+              hmbird: $hmbird,
+              opt: $opt,
+              bbr: $bbr3,
+              bbr3: $bbr3,
+              bbg: $bbg,
+              ntsync: $ntsync,
+              ds: $ds
+            })' > matrix.json
+
+          count=$(jq 'length' matrix.json)
+          [ "$count" -gt 0 ] || { echo "::error::No matching configs in configs/a16/"; exit 1; }
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          pick_repo() {
+            for cand in "$@"; do
+              if gh api "repos/${cand}" --jq '.full_name' >/dev/null 2>&1; then
+                echo "$cand"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          resolve_ksu() {
+            local ktype="$1"
+            local custom_ref="${{ inputs.ksu_custom_ref }}"
+            local full_repo="" ref=""
+
+            case "$ktype" in
+              BAKASU)
+                full_repo=$(pick_repo "Baka-SU/BakaSU" "ReSukiSU/ReSukiSU") || { echo "::error::BakaSU/ReSukiSU repo not found" >&2; exit 1; }
+                ;;
+              SUKISU_NOVA)
+                full_repo=$(pick_repo "SukiSU-Nova/SukiSU-Nova" "SukiSU-Ultra/SukiSU-Ultra") || { echo "::error::SukiSU Nova/Ultra repo not found" >&2; exit 1; }
+                ;;
+              KSUN)
+                full_repo=$(pick_repo "KernelSU-Next/KernelSU-Next") || { echo "::error::KernelSU-Next repo not found" >&2; exit 1; }
+                ;;
+              *)
+                echo "::error::Unsupported KSU variant: $ktype" >&2; exit 1
+                ;;
+            esac
+
+            if [ -n "$custom_ref" ]; then
+              ref="$custom_ref"
+            else
+              if [ "$ktype" = "KSUN" ]; then
+                if gh api "repos/${full_repo}/branches/dev" --jq '.name' >/dev/null 2>&1; then
+                  ref="dev"
+                else
+                  ref=$(gh api "repos/${full_repo}" --jq '.default_branch')
+                fi
+              elif [ "$ktype" = "SUKISU_NOVA" ] && [ "${{ inputs.susfs_enable }}" = "true" ]; then
+                if curl -fsSL "https://raw.githubusercontent.com/${full_repo}/main/kernel/Kconfig" 2>/dev/null | grep -q "KSU_SUSFS"; then
+                  ref="main"
+                elif gh api "repos/${full_repo}/branches/builtin" --jq '.name' >/dev/null 2>&1; then
+                  ref="builtin"
+                elif gh api "repos/${full_repo}/branches/susfs-main" --jq '.name' >/dev/null 2>&1; then
+                  ref="susfs-main"
+                else
+                  ref=$(gh api "repos/${full_repo}" --jq '.default_branch')
+                fi
+              else
+                ref=$(gh api "repos/${full_repo}" --jq '.default_branch')
+              fi
+            fi
+
+            local sha
+            sha=$(gh api "repos/${full_repo}/commits/${ref}" --jq '.sha')
+            [ -n "$sha" ] && [ "$sha" != "null" ] || { echo "::error::Failed to resolve ${full_repo}@${ref}" >&2; exit 1; }
+            echo "  ✅ ${ktype}: ${full_repo}@${ref} -> ${sha:0:12}" >&2
+            jq -nc --arg t "$ktype" --arg r "$ref" --arg s "$sha" --arg repo "$full_repo" \
+              '{ksu_type: $t, ksu_repo: $repo, ksu_hash: $r, ksu_resolved_hash: $s}'
+          }
+
+          ksu_entries="[]"
+          if [ "${{ inputs.ksu_variant }}" = "ALL" ]; then
+            for kv in BAKASU SUKISU_NOVA KSUN; do
+              entry=$(resolve_ksu "$kv")
+              ksu_entries=$(jq -nc --argjson a "$ksu_entries" --argjson e "$entry" '$a + [$e]')
+            done
+          else
+            entry=$(resolve_ksu "${{ inputs.ksu_variant }}")
+            ksu_entries=$(jq -nc --argjson e "$entry" '[$e]')
+          fi
+
+          SUSFS_SHA="none"
+          SUSFS_VER="none"
+          if [ "${{ inputs.susfs_enable }}" = "true" ]; then
+            SUSFS_REF="${{ inputs.susfs_custom_ref }}"
+            [ -z "$SUSFS_REF" ] && SUSFS_REF="gki-android15-6.6"
+            GL_QUERY="{ project(fullPath: \"simonpunk/susfs4ksu\") { repository { ch: commit(ref: \"${SUSFS_REF}\") { sha } blobs(paths: [\"kernel_patches/include/linux/susfs.h\"], ref: \"${SUSFS_REF}\") { nodes { rawBlob } } } } }"
+            RESPONSE=$(curl -sS --fail --retry 3 --retry-delay 5 -G "https://gitlab.com/api/graphql" --data-urlencode "query=$GL_QUERY" || true)
+            SUSFS_SHA=$(echo "$RESPONSE" | jq -r '.data.project.repository.ch.sha // empty' 2>/dev/null || true)
+            SUSFS_VER=$(echo "$RESPONSE" | jq -r '.data.project.repository.blobs.nodes[0].rawBlob // empty' 2>/dev/null | grep '#define SUSFS_VERSION' | awk -F'"' '{print $2}' || true)
+            if [ -z "$SUSFS_SHA" ]; then
+              SUSFS_SHA=$(git ls-remote "https://gitlab.com/simonpunk/susfs4ksu.git" "refs/heads/${SUSFS_REF}" | awk '{print $1}')
+            fi
+            [ -n "$SUSFS_SHA" ] || { echo "::error::Cannot resolve SUSFS ref '${SUSFS_REF}'"; exit 1; }
+            echo "  ✅ SUSFS (${SUSFS_REF}) -> ${SUSFS_SHA:0:12} (${SUSFS_VER:-latest})"
+          fi
+
+          echo "susfs_hash_android15_6_6=${SUSFS_SHA}" >> "$GITHUB_OUTPUT"
+          echo "susfs_base_version=${SUSFS_VER:-unknown}" >> "$GITHUB_OUTPUT"
+
+          merged_matrix=$(jq -nc \
+            --slurpfile devices matrix.json \
+            --argjson ksu_list "$ksu_entries" \
+            --arg susfs_sha "$SUSFS_SHA" \
+            '[ $devices[0][] as $dev | $ksu_list[] as $ksu | ($dev + $ksu + {susfs_resolved_hash: $susfs_sha}) ]')
+
+          wrapped=$(jq -nc --argjson inc "$merged_matrix" '{ include: $inc }')
+          echo "matrix=$wrapped" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 🎯 Build Plan (OnePlus 13T / 13S)"
+            echo "- **Target:** \`${{ inputs.op_model }}\`"
+            echo "- **KSU Variant:** \`${{ inputs.ksu_variant }}\`"
+            echo "- **Kernel Uname Suffix:** \`-${{ inputs.kernel_uname }}\` (пример: \`6.6.118-android15-${{ inputs.kernel_uname }}\`)"
+            echo "- **SUSFS:** \`${{ inputs.susfs_enable }}\` (\`${SUSFS_VER}\` / \`${SUSFS_SHA:0:12}\`)"
+            echo "- **Epicmann24 Patches:** \`${{ inputs.epicmann_patches }}\` (filter: \`${{ inputs.epicmann_filter }}\`)"
+            echo "- **Extra Patches:** KPM=\`${{ inputs.enable_kpm }}\`, HMBIRD=\`${{ inputs.enable_hmbird }}\`, OPT=\`${{ inputs.enable_opt }}\`, BBRv3=\`${{ inputs.enable_bbr3 }}\`, BBG=\`${{ inputs.enable_bbg }}\`, NTSync=\`${{ inputs.enable_ntsync }}\`, DS=\`${{ inputs.enable_ds }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+
+      - name: Upload build matrix
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-matrix
+          path: matrix.json
+          archive: false
+          retention-days: 7
+
+  mirror_toolchain:
+    needs: set-op-model
+    if: ${{ inputs.mirror_toolchains }}
+    uses: ./.github/workflows/mirror-toolchains.yml
+    secrets: inherit
+
+  prepare_ccache:
+    name: Prepare ccache binary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download custom ccache once
+        run: |
+          set -uo pipefail
+          url="https://raw.githubusercontent.com/WildKernels/kernel_patches/refs/heads/main/ccache/ccache-x86-64"
+          for attempt in 1 2 3 4; do
+            if curl -LfsS --connect-timeout 30 --max-time 120 -H "User-Agent: Mozilla/5.0" "$url" -o ccache && [ -s ccache ]; then
+              exit 0
+            fi
+            sleep $(( attempt * 4 ))
+          done
+          rm -f ccache
+      - name: Upload ccache artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ccache-binary
+          path: ccache
+          retention-days: 1
+          if-no-files-found: warn
+
+  build:
+    name: build (${{ matrix.model }}, ${{ matrix.ksu_type }}, -${{ matrix.uname }})
+    needs: [set-op-model, mirror_toolchain, prepare_ccache]
+    if: |
+      !cancelled() &&
+      needs.set-op-model.result == 'success' &&
+      (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Install Minimal Dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential clang lld flex bison \
+            libelf-dev libssl-dev libncurses-dev zlib1g-dev liblz4-tool \
+            libxml2-utils rsync unzip dwarves file python3 ccache jq bc dos2unix kmod libdw-dev elfutils pigz aria2
+          sudo apt-get clean
+
+      - name: Get prebuilt ccache
+        uses: actions/download-artifact@v8
+        with:
+          name: ccache-binary
+          path: ccache-dl
+        continue-on-error: true
+
+      - name: Install & Configure ccache
+        run: |
+          set -euo pipefail
+          if [ -s ccache-dl/ccache ]; then
+            sudo cp -f ccache-dl/ccache /usr/bin/ccache
+            sudo chmod +x /usr/bin/ccache
+          fi
+          rm -rf ccache-dl
+          CACHE_DIR="${{ github.workspace }}/.ccache"
+          mkdir -p "$CACHE_DIR"
+          {
+            echo "CCACHE_DIR=$CACHE_DIR"
+            echo "CCACHE_MAXSIZE=12G"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_IGNOREOPTIONS=--sysroot*"
+            echo "CCACHE_COMPRESSION=true"
+            echo "CCACHE_COMPRESSION_LEVEL=3"
+            echo "CCACHE_DIRECT=true"
+            echo "CCACHE_FILE_CLONE=true"
+            echo "CCACHE_INODE_CACHE=true"
+            echo "CCACHE_IS_KERNEL_COMPILING=true"
+            echo "CCACHE_UMASK=002"
+            echo "CCACHE_LOGFILE=${{ github.workspace }}/ccache.log"
+            echo "CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime,pch_defines,system_headers,locale"
+          } >> "$GITHUB_ENV"
+          if ccache --help 2>&1 | grep -q 'depend_mode'; then
+            echo "CCACHE_DEPEND=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: 🧹 Prepare op_config_json
+        id: prepare_config
+        shell: bash
+        run: |
+          echo "config_json=$(jq -nc --argjson m '${{ toJSON(matrix) }}' '$m | del(.ksu_type, .ksu_repo, .ksu_hash, .ksu_resolved_hash, .susfs_resolved_hash)')" >> "$GITHUB_OUTPUT"
+
+      - name: 🔨 Build Kernel
+        id: build
+        uses: ./.github/actions/build-kernel
+        with:
+          op_config_json: ${{ steps.prepare_config.outputs.config_json }}
+          ksu_type: ${{ matrix.ksu_type }}
+          ksu_repo: ${{ matrix.ksu_repo }}
+          ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
+          susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          epicmann_patches: ${{ inputs.epicmann_patches }}
+          epicmann_branch: ${{ inputs.epicmann_branch }}
+          epicmann_filter: ${{ inputs.epicmann_filter }}
+          enable_kpm: ${{ inputs.enable_kpm }}
+          optimize_level: ${{ inputs.optimize_level }}
+          mlgo: ${{ inputs.mlgo }}
+          build_timestamp: ${{ inputs.build_timestamp }}
+          clean: ${{ inputs.clean_build }}
+          debug: ${{ inputs.debug }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  trigger-release:
+    needs: [set-op-model, build]
+    runs-on: ubuntu-24.04
+    if: |
+      !cancelled() &&
+      inputs.make_release == true &&
+      needs.build.result == 'success'
+    env:
+      REPO_OWNER: ${{ github.repository_owner }}
+      REPO_NAME: ${{ github.event.repository.name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 📥 Download Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: ./downloaded-artifacts
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: 🚀 Create Tag & GitHub Release
+        run: |
+          set -euo pipefail
+          rm -f ./downloaded-artifacts/ccache-binary.zip ./downloaded-artifacts/matrix.json
+          DATE_TAG="OP13T-13S-$(date -u +%Y%m%d-%H%M)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$DATE_TAG"
+          git push origin "$DATE_TAG"
+
+          {
+            echo "# 🔥 OnePlus 13T / 13S Custom Kernel (${{ inputs.kernel_uname }})"
+            echo ""
+            echo "- **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- **KSU Variant(s):** \`${{ inputs.ksu_variant }}\`"
+            echo "- **SUSFS:** \`${SUSFS_BASE_VERSION}\` (\`${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}\`)"
+            echo "- **Epicmann24 Patches:** \`${{ inputs.epicmann_patches }}\` (filter: \`${{ inputs.epicmann_filter }}\`)"
+            echo "- **Kernel Suffix:** \`-${{ inputs.kernel_uname }}\`"
+            echo ""
+            echo "### 📦 Flashable AnyKernel3 ZIPs"
+            for z in ./downloaded-artifacts/*.zip; do
+              [ -f "$z" ] && echo "- \`$(basename "$z")\`"
+            done
+          } > release_notes.md
+
+          gh release create "$DATE_TAG" \
+            --repo "${REPO_OWNER}/${REPO_NAME}" \
+            --title "OnePlus 13T/13S Kernel (${{ inputs.kernel_uname }}) — ${DATE_TAG}" \
+            --notes-file release_notes.md
+
+          for z in ./downloaded-artifacts/*.zip; do
+            [ -f "$z" ] && gh release upload "$DATE_TAG" "$z" --clobber --repo "${REPO_OWNER}/${REPO_NAME}"
+          done
