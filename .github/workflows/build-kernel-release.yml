@@ -41,6 +41,11 @@ on:
         required: false
         type: string
         default: ''
+      enable_nomount:
+        description: 'Встроить последний стабильный NoMount и приложить его метамодуль'
+        required: false
+        type: boolean
+        default: true
       kernel_uname:
         description: 'Имя в конце версии ядра (пример: encoren -> 6.6.118-android15-encoren)'
         required: true
@@ -141,6 +146,9 @@ jobs:
       device_count: ${{ steps.set-matrix.outputs.count }}
       susfs_hash_android15_6_6: ${{ steps.set-matrix.outputs.susfs_hash_android15_6_6 }}
       susfs_base_version: ${{ steps.set-matrix.outputs.susfs_base_version }}
+      nomount_tag: ${{ steps.nomount.outputs.tag }}
+      nomount_sha: ${{ steps.nomount.outputs.sha }}
+      nomount_filename: ${{ steps.nomount.outputs.filename }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_HTTP_TIMEOUT: 600
@@ -306,6 +314,42 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::endgroup::"
 
+      - name: Resolve NoMount release and download its metamodule
+        id: nomount
+        if: ${{ inputs.enable_nomount }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo=maxsteeel/nomount
+          release=$(gh api "repos/$repo/releases/latest")
+          tag=$(jq -er '.tag_name' <<< "$release")
+          [[ "$tag" =~ ^v[0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::Unexpected NoMount release tag"; exit 1; }
+          sha=$(gh api "repos/$repo/commits/$tag" --jq '.sha')
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::Could not resolve the NoMount release commit"; exit 1; }
+
+          asset=$(jq -ce '[.assets[] | select(.name | test("^NoMount-[A-Za-z0-9._-]+\\.zip$"))]
+            | if length == 1 then .[0] else error("Expected exactly one NoMount metamodule ZIP") end' <<< "$release")
+          filename=$(jq -er '.name' <<< "$asset")
+          digest=$(jq -er '.digest' <<< "$asset")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::Missing or invalid NoMount ZIP checksum"; exit 1; }
+
+          gh release download "$tag" --repo "$repo" --pattern "$filename" --dir nomount-module
+          printf '%s  %s\n' "${digest#sha256:}" "nomount-module/$filename" | sha256sum --check
+          {
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "filename=$filename"
+          } >> "$GITHUB_OUTPUT"
+          printf -- '- **NoMount:** [%s](https://github.com/%s/releases/tag/%s) (%s)\n' "$tag" "$repo" "$tag" "${sha:0:12}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload NoMount metamodule
+        if: ${{ inputs.enable_nomount }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: nomount-module/${{ steps.nomount.outputs.filename }}
+          archive: false
+          if-no-files-found: error
+
       - name: Upload build matrix
         uses: actions/upload-artifact@v7
         with:
@@ -423,6 +467,8 @@ jobs:
           ksu_repo: ${{ matrix.ksu_repo }}
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
+          nomount_tag: ${{ needs.set-op-model.outputs.nomount_tag }}
+          nomount_sha: ${{ needs.set-op-model.outputs.nomount_sha }}
           epicmann_patches: ${{ inputs.epicmann_patches }}
           epicmann_branch: ${{ inputs.epicmann_branch }}
           epicmann_filter: ${{ inputs.epicmann_filter }}
@@ -446,6 +492,8 @@ jobs:
       REPO_NAME: ${{ github.event.repository.name }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SUSFS_BASE_VERSION: ${{ needs.set-op-model.outputs.susfs_base_version }}
+      NOMOUNT_TAG: ${{ needs.set-op-model.outputs.nomount_tag }}
+      NOMOUNT_FILENAME: ${{ needs.set-op-model.outputs.nomount_filename }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v6
@@ -463,6 +511,10 @@ jobs:
         run: |
           set -euo pipefail
           rm -f ./downloaded-artifacts/ccache-binary.zip ./downloaded-artifacts/matrix.json
+          if [ -n "$NOMOUNT_TAG" ] && [ ! -f "./downloaded-artifacts/$NOMOUNT_FILENAME" ]; then
+            echo "::error::NoMount metamodule ZIP is missing from the downloaded artifacts"
+            exit 1
+          fi
           DATE_TAG="OP13T-13S-$(date -u +%Y%m%d-%H%M)"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -475,13 +527,21 @@ jobs:
             echo "- **Build Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "- **KSU Variant(s):** \`${{ inputs.ksu_variant }}\`"
             echo "- **SUSFS:** \`${SUSFS_BASE_VERSION}\` (\`${{ needs.set-op-model.outputs.susfs_hash_android15_6_6 }}\`)"
+            if [ -n "$NOMOUNT_TAG" ]; then
+              echo "- **NoMount:** \`$NOMOUNT_TAG\`"
+            fi
             echo "- **Epicmann24 Patches:** \`${{ inputs.epicmann_patches }}\` (filter: \`${{ inputs.epicmann_filter }}\`)"
             echo "- **Kernel Suffix:** \`-${{ inputs.kernel_uname }}\`"
             echo ""
             echo "### 📦 Flashable AnyKernel3 ZIPs"
-            for z in ./downloaded-artifacts/*.zip; do
+            for z in ./downloaded-artifacts/AK3_*.zip; do
               [ -f "$z" ] && echo "- \`$(basename "$z")\`"
             done
+            if [ -n "$NOMOUNT_TAG" ]; then
+              echo ""
+              echo "### NoMount metamodule (install via the root manager)"
+              echo "- \`$NOMOUNT_FILENAME\`"
+            fi
           } > release_notes.md
 
           gh release create "$DATE_TAG" \

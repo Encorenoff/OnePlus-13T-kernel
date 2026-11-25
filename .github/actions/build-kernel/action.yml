@@ -5,75 +5,65 @@ inputs:
   op_config_json:
     description: 'JSON string containing device config'
     required: true
-    type: string
   ksu_type:
     description: 'Select KSU Variant'
     required: true
-    type: choice
-    options:
-      - BAKASU
-      - SUKISU_NOVA
-      - KSUN
   ksu_repo:
     description: 'Resolved GitHub owner/repo for KSU'
     required: false
-    type: string
     default: ""
   ksu_branch_or_hash:
     description: 'KSU branch or commit hash'
     required: false
-    type: string
     default: ""
   susfs_commit_hash_or_branch:
     description: 'SUSFS branch or commit hash'
     required: false
-    type: string
     default: ""
+  nomount_tag:
+    description: 'Resolved NoMount release tag'
+    required: false
+    default: ''
+  nomount_sha:
+    description: 'Commit SHA of the resolved NoMount release'
+    required: false
+    default: ''
   epicmann_patches:
     description: 'Apply patches from epicmann24/android_kernel_common_oneplus_sm8750'
     required: false
-    type: boolean
-    default: true
+    default: 'true'
   epicmann_branch:
     description: 'Branch in epicmann24 repo'
     required: false
-    type: string
     default: ''
   epicmann_filter:
     description: 'Category/keyword/SHA filter for epicmann24 patches'
     required: false
-    type: string
     default: 'all'
   enable_kpm:
     description: 'Enable KPM (CONFIG_KPM=y + patch_linux)'
     required: false
-    type: boolean
-    default: true
+    default: 'true'
   build_timestamp:
     description: 'Custom kernel build timestamp for uname -a'
     required: false
-    type: string
     default: ''
   optimize_level:
     description: 'Compiler optimization level (O2 or O3)'
     required: false
-    type: string
     default: O2
   mlgo:
     description: 'Enable MLGO'
     required: false
-    type: boolean
-    default: true
+    default: 'true'
   clean:
     description: 'Clean build without ccache'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   debug:
     description: 'Enable debug mode'
     required: false
-    type: boolean
-    default: false
+    default: 'false'
   github_token:
     description: 'GitHub Token'
     required: true
@@ -628,6 +618,31 @@ runs:
         echo "CONFIG_DEBLOAT_VENDOR_MODULES=\"${OP_BLACKLIST_MODULES},oplus_network_tuning,oplus_networks_tuning\"" >> arch/arm64/configs/gki_defconfig
         patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch" || true
 
+    - name: Integrate NoMount into the kernel
+      if: ${{ inputs.nomount_tag != '' }}
+      shell: bash
+      env:
+        NOMOUNT_TAG: ${{ inputs.nomount_tag }}
+        NOMOUNT_SHA: ${{ inputs.nomount_sha }}
+      run: |
+        set -euo pipefail
+        cd "$COMMON_KERNEL_FOLDER"
+        checkout=$(mktemp -d "$RUNNER_TEMP/nomount.XXXXXX")
+        trap 'rm -rf -- "$checkout"' EXIT
+        git -c http.sslVerify=true clone --depth 1 --single-branch --branch "$NOMOUNT_TAG" \
+          https://github.com/maxsteeel/nomount.git "$checkout"
+        if [ "$(git -C "$checkout" rev-parse HEAD)" != "$NOMOUNT_SHA" ]; then
+          echo "::error::NoMount tag no longer points to the resolved release commit"
+          exit 1
+        fi
+
+        mkdir -p fs/nomount
+        cp -a "$checkout/kernel/src/." fs/nomount/
+        grep -qxF 'source "fs/nomount/Kconfig"' fs/Kconfig || printf '\nsource "fs/nomount/Kconfig"\n' >> fs/Kconfig
+        grep -qxF 'obj-$(CONFIG_NOMOUNT) += nomount/' fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+        echo "NOMOUNT_VERSION=$NOMOUNT_TAG" >> "$GITHUB_ENV"
+        printf 'NoMount %s (%s)\n' "$NOMOUNT_TAG" "$NOMOUNT_SHA" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
+
     - name: 🏷️ Customize Kernel Branding (6.6.xxx-android15-encoren)
       shell: bash
       run: |
@@ -686,7 +701,14 @@ runs:
         fi
 
         scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+        if [ -n "${NOMOUNT_VERSION:-}" ]; then
+          scripts/config --file "$OUT/.config" -e NOMOUNT
+        fi
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
+        if [ -n "${NOMOUNT_VERSION:-}" ] && ! grep -qxF 'CONFIG_NOMOUNT=y' "$OUT/.config"; then
+          echo "::error::CONFIG_NOMOUNT=y is missing from the final kernel config"
+          exit 1
+        fi
 
         KCFLAGS="$KCFLAGS -Wno-error -pipe ${KCFLAGS_EXTRA}"
         KCPPFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=. -DCONFIG_OPTIMIZE_INLINING"
@@ -762,6 +784,10 @@ runs:
           ZIP_NAME="AK3_${OP_MODEL}_${TKERNEL_VER}-${ANDROID_VER}-${OP_UNAME}_${{ inputs.ksu_type }}_${KSUVER:-latest}.zip"
         fi
 
+        if [ -n "${NOMOUNT_VERSION:-}" ]; then
+          ZIP_NAME="${ZIP_NAME%.zip}_NoMount_${NOMOUNT_VERSION}.zip"
+        fi
+
         zip -r9 "$ZIP_NAME" ./* -x "*.git*" -x "$ZIP_NAME" -x "README.md"
         mv "$ZIP_NAME" "$ARTIFACTS_FOLDER/"
         ZIP_SHA256=$(sha256sum "$ARTIFACTS_FOLDER/$ZIP_NAME" | awk '{print $1}')
@@ -774,6 +800,9 @@ runs:
           echo "- **Kernel Uname:** \`${KERNEL_UNAME}\`"
           echo "- **KSU:** \`${{ inputs.ksu_type }} v${KSUVER:-unknown}\` (\`${KSU_COMMIT_SHA:0:8}\`)"
           echo "- **SUSFS:** \`${SUSVER:-none}\`"
+          if [ -n "${NOMOUNT_VERSION:-}" ]; then
+            echo "- **NoMount:** \`${NOMOUNT_VERSION}\`"
+          fi
           echo "- **Artifact:** \`${ZIP_NAME}\`"
           echo "- **SHA256:** \`${ZIP_SHA256}\`"
         } >> "$GITHUB_STEP_SUMMARY"
