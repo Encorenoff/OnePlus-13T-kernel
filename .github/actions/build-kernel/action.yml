@@ -254,21 +254,6 @@ runs:
         rm -f common/android/abi_gki_protected_exports_* || true
         sed -i 's/protected_modules = \[.*\]/protected_modules = []/' common/modules.bzl || true
 
-    - name: 🧩 Apply Epicmann24 SM8750 Patches
-      if: ${{ inputs.epicmann_patches == true || inputs.epicmann_patches == 'true' }}
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.github_token }}
-      run: |
-        set -euo pipefail
-        bash "${GITHUB_WORKSPACE}/action-source/scripts/apply_epicmann24_patches.sh" \
-          "$COMMON_KERNEL_FOLDER" \
-          "${RUNNER_TEMP}/epicmann_work" \
-          "${{ inputs.epicmann_branch }}" \
-          "${{ inputs.epicmann_filter }}" \
-          "$OP_MODEL" \
-          "$GITHUB_STEP_SUMMARY"
-
     - name: Add BakaSU (ReSukiSU)
       if: ${{ inputs.ksu_type == 'BAKASU' }}
       shell: bash
@@ -412,20 +397,56 @@ runs:
 
         python3 "$COMPAT_PY" --stage 1 --root "$COMMON_KERNEL_FOLDER" --kmi "$KMI" --sublevel "$SUBLEVEL" --soc "$OP_SOC" --state "$COMPAT_STATE"
 
-        if ! grep -qxF 'extern void __fold_filemap_fixup_entry(struct vma_iterator *iter, unsigned long *end);' ./include/linux/page_size_compat.h 2>/dev/null; then
-          patch -p1 --forward --batch --fuzz=0 < "$KERNEL_PATCHES_FOLDER/common/backports/fold_fixup_entries.patch" || true
+        # The kernel source comes from an archive inside a separate Git checkout.
+        export GIT_CEILING_DIRECTORIES="$KERNEL_PLATFORM_FOLDER"
+        if ! grep -qxF 'extern void __fold_filemap_fixup_entry(struct vma_iterator *iter, unsigned long *end);' include/linux/page_size_compat.h 2>/dev/null; then
+          FOLD_PATCH="$KERNEL_PATCHES_FOLDER/common/backports/fold_fixup_entries.patch"
+          if git apply --check -- "$FOLD_PATCH"; then
+            git apply -- "$FOLD_PATCH"
+          fi
         fi
 
-        find . \( -name "*.rej" -o -name "*.orig" \) -delete
-        if patch --dry-run --forward --batch -p1 < "$MAIN_PATCH" >/dev/null 2>&1; then
-          patch --forward --batch --no-backup-if-mismatch -p1 < "$MAIN_PATCH"
-        else
-          FIX_PATCH="$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches/$susfs_version/fix_50_add_susfs_in_${SUSFS_KERNEL_BRANCH}.patch"
-          [ -f "$FIX_PATCH" ] || FIX_PATCH=$(find "$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches" -name "fix_50_add_susfs_in_${SUSFS_KERNEL_BRANCH}.patch" | sort -V | tail -n1 || true)
-          patch --forward --batch --no-backup-if-mismatch -p1 < "$MAIN_PATCH" || true
-          [ -n "$FIX_PATCH" ] && [ -f "$FIX_PATCH" ] && patch --forward --batch --no-backup-if-mismatch -p1 < "$FIX_PATCH" || true
-          find . -name "*.rej" -delete || true
+        FIX_ROOT="$KERNEL_PATCHES_FOLDER/next/susfs_fix_patches"
+        FIX_NAME="fix_50_add_susfs_in_${SUSFS_KERNEL_BRANCH}.patch"
+        FIX_PATCH="$FIX_ROOT/$susfs_version/$FIX_NAME"
+        if [ ! -f "$FIX_PATCH" ] && [ -d "$FIX_ROOT" ]; then
+          FIX_PATCH=$(find "$FIX_ROOT" -name "$FIX_NAME" | sort -V | tail -n1)
         fi
+
+        # OnePlus 6.6.118 has different outer context in show_smap().
+        # Try the complete patch with two context lines if exact matching fails.
+        SUSFS_PATCH=""
+        for context in '' -C2; do
+          context_args=()
+          if [ -n "$context" ]; then
+            context_args+=("$context")
+          fi
+          for candidate in "$MAIN_PATCH" "$FIX_PATCH"; do
+            [ -f "$candidate" ] || continue
+            if git apply --check --reverse "${context_args[@]}" -- "$candidate" 2>/dev/null; then
+              echo "SUSFS patch already present: $(basename "$candidate")"
+            elif git apply --check "${context_args[@]}" -- "$candidate" 2>/dev/null; then
+              git apply "${context_args[@]}" -- "$candidate"
+            else
+              continue
+            fi
+            SUSFS_PATCH="$candidate"
+            break 2
+          done
+        done
+        if [ -z "$SUSFS_PATCH" ]; then
+          echo "::error::No complete SUSFS kernel patch applies to ${OP_MODEL} (${TKERNEL_VER})"
+          git apply --check -C2 -- "$MAIN_PATCH" || true
+          exit 1
+        fi
+
+        protected_paths="$RUNNER_TEMP/susfs-protected-paths.txt"
+        {
+          git apply --numstat -- "$SUSFS_PATCH" | cut -f3-
+          printf '%s\n' arch/arm64/configs/gki_defconfig drivers/Kconfig drivers/Makefile \
+            include/linux/page_size_compat.h mm/page_size_compat.c
+        } | sort -u > "$protected_paths"
+        echo "SUSFS_PROTECTED_PATHS_FILE=$protected_paths" >> "$GITHUB_ENV"
 
         python3 "$COMPAT_PY" --stage 2 --root "$COMMON_KERNEL_FOLDER" --kmi "$KMI" --sublevel "$SUBLEVEL" --soc "$OP_SOC" --state "$COMPAT_STATE"
 
@@ -448,6 +469,21 @@ runs:
         CONFIG_KSU_SUSFS_SUS_MAP=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
+
+    - name: 🧩 Apply Epicmann24 SM8750 Patches
+      if: ${{ inputs.epicmann_patches == true || inputs.epicmann_patches == 'true' }}
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+      run: |
+        set -euo pipefail
+        bash "${GITHUB_WORKSPACE}/action-source/scripts/apply_epicmann24_patches.sh" \
+          "$COMMON_KERNEL_FOLDER" \
+          "${RUNNER_TEMP}/epicmann_work" \
+          "${{ inputs.epicmann_branch }}" \
+          "${{ inputs.epicmann_filter }}" \
+          "$OP_MODEL" \
+          "$GITHUB_STEP_SUMMARY"
 
     - name: Add BBG LSM
       if: ${{ env.OP_BBG == 'true' }}
@@ -705,6 +741,10 @@ runs:
           scripts/config --file "$OUT/.config" -e NOMOUNT
         fi
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
+        if [ "${OP_SUSFS:-false}" = "true" ] && ! grep -qxF 'CONFIG_KSU_SUSFS=y' "$OUT/.config"; then
+          echo "::error::CONFIG_KSU_SUSFS=y is missing from the final kernel config"
+          exit 1
+        fi
         if [ -n "${NOMOUNT_VERSION:-}" ] && ! grep -qxF 'CONFIG_NOMOUNT=y' "$OUT/.config"; then
           echo "::error::CONFIG_NOMOUNT=y is missing from the final kernel config"
           exit 1

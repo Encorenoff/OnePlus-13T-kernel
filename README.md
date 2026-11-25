@@ -8,7 +8,7 @@
 - **Автоподбор последнего SUSFS:** автоматическая синхронизация последнего коммита `gki-android15-6.6` из `simonpunk/susfs4ksu`.
 - **NoMount:** переключатель `enable_nomount` по умолчанию включает драйвер из последнего стабильного релиза. ZIP метамодуля той же версии доступен отдельно в артефактах сборки. При включённом `make_release` он также добавляется в GitHub Release. Устанавливайте его через менеджер KernelSU.
 - **Выборочные патчи перед запуском Action:**
-  - `epicmann_patches`: включить/выключить патчи `epicmann24`.
+  - `epicmann_patches`: включить/выключить патчи `epicmann24`. При включённом SUSFS применяются после него и пропускают изменения в защищённых файлах, в том числе при выборе по SHA.
   - `epicmann_filter`: `all` либо категории (`charging,thermal,haptics,wakelock,sched,mm,io,net,display`) или конкретные SHA-коммиты.
   - Переключатели `enable_kpm`, `enable_hmbird`, `enable_opt`, `enable_bbr3`, `enable_bbg`, `enable_ntsync`, `enable_ds`.
 - **Брендинг ядра:** поле `kernel_uname` (по умолчанию `encoren` → `6.6.118-android15-encoren`).

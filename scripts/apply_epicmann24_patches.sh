@@ -136,8 +136,8 @@ else
 
   for sha in "${ALL_COMMITS[@]}"; do
     subj=$(git -C "$GIT_DIR" log -1 --format=%s "$sha")
-    if echo "$subj" | grep -qiE '(kernelsu|sukisu|resukisu|bakasu|susfs|ksu[: _-]|anykernel|localversion)'; then
-      echo "  [SKIP-KSU/SUSFS] ${sha:0:8} $subj"
+    if echo "$subj" | grep -qiE '(anykernel|localversion)'; then
+      echo "  [SKIP] ${sha:0:8} $subj"
       continue
     fi
 
@@ -158,25 +158,40 @@ fi
 
 echo "[epicmann24] Selected ${#SELECTED_COMMITS[@]} commit(s)"
 
+excluded_paths=(
+  ':(exclude,icase)KernelSU*'
+  ':(exclude,icase)drivers/kernelsu'
+  ':(exclude)fs/susfs*'
+  ':(exclude)include/linux/susfs*'
+)
+if [ -n "${SUSFS_PROTECTED_PATHS_FILE:-}" ]; then
+  while IFS= read -r path; do
+    excluded_paths+=(":(top,exclude,literal)$path")
+  done < "$SUSFS_PROTECTED_PATHS_FILE"
+fi
+
 applied=0
 already=0
 conflicts=0
+protected=0
 APPLIED_LOG=""
 
 idx=1
 for sha in "${SELECTED_COMMITS[@]}"; do
   subj=$(git -C "$GIT_DIR" log -1 --format=%s "$sha")
+  if grep -qiE '(kernelsu|sukisu|resukisu|bakasu|susfs|ksu[: _-])' <<< "$subj"; then
+    protected=$((protected + 1))
+    echo "  [SKIP-KSU/SUSFS] ${sha:0:8} $subj"
+    continue
+  fi
   pfile=$(printf "%s/%04d-%s.patch" "$PATCH_DIR" "$idx" "${sha:0:10}")
   idx=$((idx + 1))
 
-  git -C "$GIT_DIR" format-patch -1 "$sha" --stdout -- . \
-    ':(exclude)KernelSU' \
-    ':(exclude)KernelSU-Next' \
-    ':(exclude)drivers/kernelsu' \
-    ':(exclude)fs/susfs*' \
-    ':(exclude)include/linux/susfs*' > "$pfile" || true
+  git -C "$GIT_DIR" format-patch -1 "$sha" --stdout --no-renames -- . "${excluded_paths[@]}" > "$pfile"
 
   if ! grep -q '^diff --git ' "$pfile"; then
+    protected=$((protected + 1))
+    echo "  [NO-PATCH] ${sha:0:8} $subj"
     rm -f "$pfile"
     continue
   fi
@@ -203,7 +218,7 @@ done
 find "$KERNEL_DIR" \( -name '*.rej' -o -name '*.orig' \) -delete || true
 rm -rf "$GIT_DIR"
 
-echo "[epicmann24] Done: applied=${applied}, already=${already}, conflicts_skipped=${conflicts}"
+echo "[epicmann24] Done: applied=${applied}, already=${already}, conflicts_skipped=${conflicts}, protected_or_empty=${protected}"
 
 if [ -n "$SUMMARY_FILE" ]; then
   {
@@ -212,7 +227,7 @@ if [ -n "$SUMMARY_FILE" ]; then
     echo ""
     echo "- **Branch:** \`${EPIC_BRANCH}\` (\`${EPIC_HEAD:0:10}\`)"
     echo "- **Filter:** \`${EPIC_FILTER}\`"
-    echo "- **Result:** ✅ Applied: **${applied}** | ℹ️ Already present: **${already}** | ⚠️ Skipped: **${conflicts}**"
+    echo "- **Result:** ✅ Applied: **${applied}** | ℹ️ Already present: **${already}** | ⚠️ Conflicts: **${conflicts}** | Protected or empty: **${protected}**"
     if [ -n "$APPLIED_LOG" ]; then
       echo ""
       echo "<details><summary>Applied Epicmann24 commits</summary>"
