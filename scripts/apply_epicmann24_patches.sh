@@ -187,6 +187,22 @@ if [ -n "${SUSFS_PROTECTED_PATHS_FILE:-}" ]; then
   done < "$SUSFS_PROTECTED_PATHS_FILE"
 fi
 
+# These files implement coupled APIs from the OnePlus source tree. The fork's
+# alternative implementations require a full backport, not separate commits.
+kernel_api_paths=(
+  include/linux/local_lock.h
+  include/linux/local_lock_internal.h
+  mm/vmscan.c
+  mm/workingset.c
+  fs/erofs/decompressor.c
+  crypto/lz4.c
+  crypto/lz4hc.c
+  include/linux/lz4.h
+  lib/lz4
+  lib/decompress_unlz4.c
+  ':(glob)arch/arm64/lib/**/lz4*'
+)
+
 applied=0
 already=0
 conflicts=0
@@ -201,10 +217,9 @@ for sha in "${SELECTED_COMMITS[@]}"; do
     echo "  [SKIP-KSU/SUSFS] ${sha:0:8} $subj"
     continue
   fi
-  if ! git -C "$GIT_DIR" diff-tree --root --quiet "$sha" -- \
-    include/linux/local_lock.h include/linux/local_lock_internal.h; then
+  if ! git -C "$GIT_DIR" diff-tree --root --quiet "$sha" -- "${kernel_api_paths[@]}"; then
     protected=$((protected + 1))
-    echo "  [SKIP-LOCAL-LOCK] ${sha:0:8} $subj"
+    echo "  [SKIP-KERNEL-API] ${sha:0:8} $subj"
     continue
   fi
   pfile=$(printf "%s/%04d-%s.patch" "$PATCH_DIR" "$idx" "${sha:0:10}")
