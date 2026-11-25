@@ -500,21 +500,50 @@ runs:
       run: |
         set -euo pipefail
         cd "$COMMON_KERNEL_FOLDER"
+        export GIT_CEILING_DIRECTORIES="$KERNEL_PLATFORM_FOLDER"
+
+        apply_optional_patch() {
+          local patch_file="$1"
+          local name="${patch_file##*/}"
+          local result
+          shift
+          if git apply --check --reverse "$@" -- "$patch_file" >/dev/null 2>&1; then
+            echo "[patch] Already present: $name"
+          elif result=$(git apply "$@" -- "$patch_file" 2>&1); then
+            echo "[patch] Applied: $name"
+          else
+            echo "::warning::Skipping incompatible optional patch $name"
+            printf '%s\n' "$result"
+            return 1
+          fi
+        }
 
         if [ "$OP_HMBIRD" = "true" ]; then
           FENGCHI="$KERNEL_PATCHES_FOLDER/oneplus/hmbird/fengchi_${OP_MODEL}_${OP_OS_VERSION}.patch"
           if [ -f "$FENGCHI" ]; then
-            dos2unix "$FENGCHI" && patch -p1 -F 3 --forward < "$FENGCHI" || true
-            dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch" && patch -p1 -F 3 --forward < "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/overwriter.patch" || true
-            chmod +x ./drivers/of/overwriter/overwrite_configs/convert_configs.sh 2>/dev/null || true
-            dos2unix "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/hmbird_config.patch" && patch -p1 -F 3 --forward < "$KERNEL_PATCHES_FOLDER/oneplus/hmbird/hmbird_config.patch" || true
+            HMBIRD_DIR="$KERNEL_PATCHES_FOLDER/oneplus/hmbird"
+            for hmbird_patch in "$FENGCHI" "$HMBIRD_DIR/overwriter.patch" "$HMBIRD_DIR/hmbird_config.patch"; do
+              if [ -f "$hmbird_patch" ]; then
+                dos2unix "$hmbird_patch"
+              fi
+            done
+            apply_optional_patch "$FENGCHI" -C2 || true
+            if [ ! -f drivers/of/overwriter/overwrite_config_loader.c ]; then
+              apply_optional_patch "$HMBIRD_DIR/overwriter.patch" -C2 || true
+            fi
+            if [ -f drivers/of/overwriter/overwrite_configs/convert_configs.sh ]; then
+              chmod +x drivers/of/overwriter/overwrite_configs/convert_configs.sh
+              apply_optional_patch "$HMBIRD_DIR/hmbird_config.patch" -C2 || true
+            fi
           fi
         fi
 
         # Module overlay (с исправленным копированием модулей: -n вместо -z)
-        patch -p1 --forward < "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-${ANDROID_VER}-${KERNEL_VER}.patch" || true
-        chmod +x ./kernel/module/module_overlay/convert_overlay.sh 2>/dev/null || true
-        if [ -d "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/modules" ]; then
+        OVERLAY_PATCH="$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-${ANDROID_VER}-${KERNEL_VER}.patch"
+        if apply_optional_patch "$OVERLAY_PATCH" -C2 && [ -d "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/modules" ]; then
+          if [ -f kernel/module/module_overlay/convert_overlay.sh ]; then
+            chmod +x kernel/module/module_overlay/convert_overlay.sh
+          fi
           SOC="${OP_BRANCH#*/}"
           copied_modules=""
           declare -A selected_file=()
@@ -576,37 +605,48 @@ runs:
                    avoid_extra_s2idle_wake_attempts disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks \
                    increase_ext4_default_commit_age increase_sk_mem_packets reduce_pci_pme_wakeups \
                    silence_irq_cpu_logspam silence_system_logspam use_unlikely_wrap_cpufreq; do
-            patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/${p}.patch" || true
+            apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/${p}.patch" -C2 || true
           done
-          sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' \
-            "$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch" | patch -p1 -F3 --forward --batch || true
+          CLEAR_PAGE_PATCH="$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
+          if [ -f "$CLEAR_PAGE_PATCH" ]; then
+            sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' \
+              "$CLEAR_PAGE_PATCH" > "$RUNNER_TEMP/clear_page_16bytes_align.patch"
+            apply_optional_patch "$RUNNER_TEMP/clear_page_16bytes_align.patch" -C2 || true
+          fi
         fi
 
         if [ "$OP_NTSYNC" = "true" ]; then
           NTSYNC_DIR="$KERNEL_PATCHES_FOLDER/common/ntsync"
           NTSYNC_COMPAT="$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}.patch"
           [ -f "$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}_${OP_OS_VERSION}.patch" ] && NTSYNC_COMPAT="$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}_${OP_OS_VERSION}.patch"
-          patch -p1 --forward --batch < "$NTSYNC_COMPAT" || true
-          patch -p1 --forward --batch < "$NTSYNC_DIR/ntsync_base.patch" || true
-          echo "CONFIG_NTSYNC=y" >> arch/arm64/configs/gki_defconfig
+          if apply_optional_patch "$NTSYNC_COMPAT" -C2 && apply_optional_patch "$NTSYNC_DIR/ntsync_base.patch" -C2; then
+            scripts/config --file arch/arm64/configs/gki_defconfig -e NTSYNC
+          fi
         fi
 
         if [ "$OP_UNICODE" = "true" ]; then
-          patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch" || true
+          apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/unicode_bypass_fix_6.1+.patch" -C2 || true
         fi
 
         if [ "$OP_BBR3" = "true" ]; then
-          patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/bbrv3/0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch" || true
-          cat >> arch/arm64/configs/gki_defconfig <<EOF
-        CONFIG_TCP_CONG_ADVANCED=y
-        CONFIG_TCP_CONG_BBR=y
-        CONFIG_TCP_CONG_BBR3=y
-        EOF
+          has_bbr3() {
+            [ -f net/ipv4/tcp_bbr3.c ] && grep -qxF 'config TCP_CONG_BBR3' net/ipv4/Kconfig &&
+              grep -qF '$(CONFIG_TCP_CONG_BBR3)' net/ipv4/Makefile
+          }
+          if ! has_bbr3; then
+            apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/bbrv3/0001-net-tcp-backport-BBRv3-to-${ANDROID_VER}-${KERNEL_VER}.patch" -C2 || true
+          fi
+          scripts/config --file arch/arm64/configs/gki_defconfig -e TCP_CONG_ADVANCED -e TCP_CONG_BBR
+          if has_bbr3; then
+            scripts/config --file arch/arm64/configs/gki_defconfig -e TCP_CONG_BBR3
+          else
+            echo "::warning::BBRv3 is unavailable on this source tree; using the existing BBR implementation"
+          fi
         fi
 
         if [ "$OP_DS" = "true" ]; then
-          patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch" || true
-          patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" || true
+          apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch" -C2 || true
+          apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" -C2 || true
           cat >> arch/arm64/configs/gki_defconfig <<EOF
         CONFIG_SYSVIPC=y
         CONFIG_DEVTMPFS=y
@@ -649,10 +689,13 @@ runs:
         CONFIG_TRACEPOINTS=y
         EOF
 
-        patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/fake_config.patch" || true
-        echo "CONFIG_FAKE_DISABLE=CONFIG_TCP_CONG_ADVANCED CONFIG_IP6_NF_NAT" >> "$GITHUB_ENV"
-        echo "CONFIG_DEBLOAT_VENDOR_MODULES=\"${OP_BLACKLIST_MODULES},oplus_network_tuning,oplus_networks_tuning\"" >> arch/arm64/configs/gki_defconfig
-        patch -p1 --forward --batch < "$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch" || true
+        if apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/fake_config.patch" -C2; then
+          echo "CONFIG_FAKE_DISABLE=CONFIG_TCP_CONG_ADVANCED CONFIG_IP6_NF_NAT" >> "$GITHUB_ENV"
+        fi
+        if apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch" -C2; then
+          scripts/config --file arch/arm64/configs/gki_defconfig --set-str DEBLOAT_VENDOR_MODULES \
+            "${OP_BLACKLIST_MODULES},oplus_network_tuning,oplus_networks_tuning"
+        fi
 
     - name: Integrate NoMount into the kernel
       if: ${{ inputs.nomount_tag != '' }}

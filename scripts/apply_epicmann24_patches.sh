@@ -42,10 +42,6 @@ echo "[epicmann24] Filter: $EPIC_FILTER"
 git -C "$GIT_DIR" init -q
 git -C "$GIT_DIR" remote add epic "$EPIC_REPO"
 git -C "$GIT_DIR" remote add oplus "$OPLUS_REPO"
-git -C "$GIT_DIR" fetch --no-tags epic "$EPIC_BRANCH"
-EPIC_HEAD=$(git -C "$GIT_DIR" rev-parse FETCH_HEAD)
-git -C "$GIT_DIR" branch -f epic_head "$EPIC_HEAD"
-
 FILTER_CLEAN=$(echo "$EPIC_FILTER" | tr ',' ' ' | tr '[:upper:]' '[:lower:]')
 read -r -a TOKENS <<< "$FILTER_CLEAN"
 if [ "${#TOKENS[@]}" -eq 0 ]; then
@@ -59,6 +55,14 @@ for tok in "${TOKENS[@]}"; do
     break
   fi
 done
+
+fetch_depth=()
+if [ "$ALL_EXPLICIT" = false ]; then
+  fetch_depth=(--depth=512)
+fi
+git -C "$GIT_DIR" fetch --no-tags "${fetch_depth[@]}" epic "$EPIC_BRANCH"
+EPIC_HEAD=$(git -C "$GIT_DIR" rev-parse FETCH_HEAD)
+git -C "$GIT_DIR" branch -f epic_head "$EPIC_HEAD"
 
 match_category() {
   local sha="$1"
@@ -116,27 +120,40 @@ else
     "oneplus/sm8750_v_15.0.0_oneplus_13"
   )
 
-  BASE_SHA=""
-  for ob in "${CANDIDATE_BRANCHES[@]}"; do
-    if git -C "$GIT_DIR" fetch --no-tags oplus "$ob" 2>/dev/null; then
-      BASE_SHA=$(git -C "$GIT_DIR" merge-base FETCH_HEAD epic_head 2>/dev/null || true)
-      if [ -n "$BASE_SHA" ]; then
-        echo "[epicmann24] Merge-base found: ${BASE_SHA:0:12} (against $ob)"
-        break
-      fi
-    fi
-  done
-
+  # The fork's platform import includes thousands of already backported commits.
+  find_platform_baseline() {
+    git -C "$GIT_DIR" log -1 --first-parent --merges --format=%H \
+      --extended-regexp --grep="^Merge tag 'KERNEL\.PLATFORM\." epic_head
+  }
+  BASE_SHA=$(find_platform_baseline)
+  if [ -z "$BASE_SHA" ] && [ "$(git -C "$GIT_DIR" rev-parse --is-shallow-repository)" = true ]; then
+    git -C "$GIT_DIR" fetch --no-tags --unshallow epic "$EPIC_BRANCH"
+    BASE_SHA=$(find_platform_baseline)
+  fi
   if [ -n "$BASE_SHA" ]; then
-    mapfile -t ALL_COMMITS < <(git -C "$GIT_DIR" rev-list --reverse --no-merges "${BASE_SHA}..epic_head")
+    echo "[epicmann24] Platform baseline: ${BASE_SHA:0:12}"
   else
-    echo "::warning::Общая ветка с OnePlusOSS не найдена, берём последние 200 коммитов epicmann24"
-    mapfile -t ALL_COMMITS < <(git -C "$GIT_DIR" rev-list --reverse --no-merges -n 200 epic_head)
+    for ob in "${CANDIDATE_BRANCHES[@]}"; do
+      if git -C "$GIT_DIR" fetch --no-tags oplus "$ob" 2>/dev/null; then
+        BASE_SHA=$(git -C "$GIT_DIR" merge-base FETCH_HEAD epic_head 2>/dev/null || true)
+        if [ -n "$BASE_SHA" ]; then
+          echo "[epicmann24] Merge-base found: ${BASE_SHA:0:12} (against $ob)"
+          break
+        fi
+      fi
+    done
+  fi
+
+  ALL_COMMITS=()
+  if [ -n "$BASE_SHA" ]; then
+    mapfile -t ALL_COMMITS < <(git -C "$GIT_DIR" rev-list --first-parent --reverse --no-merges "${BASE_SHA}..epic_head")
+  else
+    echo "::warning::No Epicmann24 platform baseline or OnePlus merge-base found. Use an explicit SHA to select a commit."
   fi
 
   for sha in "${ALL_COMMITS[@]}"; do
     subj=$(git -C "$GIT_DIR" log -1 --format=%s "$sha")
-    if echo "$subj" | grep -qiE '(anykernel|localversion)'; then
+    if grep -qiE '^(revert ")?((upstream|backport|fromgit|fromlist):|Linux 6\.6\.[0-9]+)|anykernel|localversion' <<< "$subj"; then
       echo "  [SKIP] ${sha:0:8} $subj"
       continue
     fi
@@ -184,6 +201,12 @@ for sha in "${SELECTED_COMMITS[@]}"; do
     echo "  [SKIP-KSU/SUSFS] ${sha:0:8} $subj"
     continue
   fi
+  if ! git -C "$GIT_DIR" diff-tree --root --quiet "$sha" -- \
+    include/linux/local_lock.h include/linux/local_lock_internal.h; then
+    protected=$((protected + 1))
+    echo "  [SKIP-LOCAL-LOCK] ${sha:0:8} $subj"
+    continue
+  fi
   pfile=$(printf "%s/%04d-%s.patch" "$PATCH_DIR" "$idx" "${sha:0:10}")
   idx=$((idx + 1))
 
@@ -196,19 +219,14 @@ for sha in "${SELECTED_COMMITS[@]}"; do
     continue
   fi
 
-  if patch -d "$KERNEL_DIR" -p1 --forward --batch --fuzz=0 --dry-run -i "$pfile" >/dev/null 2>&1; then
+  if patch -d "$KERNEL_DIR" -p1 --reverse --forward --batch --fuzz=0 --dry-run -i "$pfile" >/dev/null 2>&1; then
+    already=$((already + 1))
+    echo "  ℹ️  [already] ${sha:0:8} $subj"
+  elif patch -d "$KERNEL_DIR" -p1 --forward --batch --fuzz=0 --dry-run -i "$pfile" >/dev/null 2>&1; then
     patch -d "$KERNEL_DIR" -p1 --forward --batch --fuzz=0 --no-backup-if-mismatch -i "$pfile" >/dev/null
     applied=$((applied + 1))
     APPLIED_LOG+="- \`${sha:0:8}\` (clean) ${subj}\n"
     echo "  ✅ [clean]  ${sha:0:8} $subj"
-  elif patch -d "$KERNEL_DIR" -p1 --forward --batch --fuzz=3 --dry-run -i "$pfile" >/dev/null 2>&1; then
-    patch -d "$KERNEL_DIR" -p1 --forward --batch --fuzz=3 --no-backup-if-mismatch -i "$pfile" >/dev/null
-    applied=$((applied + 1))
-    APPLIED_LOG+="- \`${sha:0:8}\` (fuzz=3) ${subj}\n"
-    echo "  ⚠️  [fuzz=3] ${sha:0:8} $subj"
-  elif patch -d "$KERNEL_DIR" -p1 --reverse --batch --dry-run -i "$pfile" >/dev/null 2>&1; then
-    already=$((already + 1))
-    echo "  ℹ️  [already] ${sha:0:8} $subj"
   else
     conflicts=$((conflicts + 1))
     echo "  ❌ [conflict-skipped] ${sha:0:8} $subj"
