@@ -8,3 +8,5 @@
 0x94c5c4a4 of_property_read_variable_u32_array
 0xf5ab7c57 platform_driver_unregister
 0x279498f1 __platform_driver_register
+0xb74f2db0 __tracepoint_android_vh_mm_get_zone_mark
+0x144645f9 reclaim_pages

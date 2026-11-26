@@ -847,8 +847,12 @@ runs:
         scripts/config --file "$OUT/.config" --set-str LOCALVERSION "${CUSTOM_LOCALVERSION}"
         if [ -n "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
           # Restore the firmware's GKI settings for prebuilt vendor modules.
-          awk '/^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]*$/ { print $1 }' \
-            android/abi_gki_aarch64 android/abi_gki_aarch64_* | LC_ALL=C sort -u > abi_symbollist.raw
+          {
+            awk '/^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]*$/ { print $1 }' \
+              android/abi_gki_aarch64 android/abi_gki_aarch64_*
+            # Include the additional exports required by this firmware's vendor modules.
+            awk 'NF && $1 !~ /^#/ { print $2 }' "$GITHUB_WORKSPACE/action-source/$OP_STOCK_MODULE_ABI"
+          } | LC_ALL=C sort -u > abi_symbollist.raw
           scripts/config --file "$OUT/.config" -e LOCALVERSION_AUTO -e MODULE_SCMVERSION \
             -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE \
             -e TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST abi_symbollist.raw
