@@ -859,11 +859,28 @@ runs:
         KCFLAGS="$KCFLAGS -Wno-error -pipe ${KCFLAGS_EXTRA}"
         KCPPFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=. -DCONFIG_OPTIMIZE_INLINING"
 
+        build_args=(
+          "LD=$COMMON_KERNEL_FOLDER/ld-wrapper" "HOSTLD=$COMMON_KERNEL_FOLDER/ld-wrapper"
+          "-j$build_jobs" "O=$OUT" "KCFLAGS=$KCFLAGS" "KCPPFLAGS=$KCPPFLAGS"
+          "CONFIG_FAKE_DISABLE=${CONFIG_FAKE_DISABLE:-}"
+        )
+        build_command=(make)
+        if [ "${{ inputs.debug }}" = "true" ]; then
+          build_command=(timeout --kill-after=30s 38m make)
+        fi
+
         BUILD_START=$(date +%s)
-        make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" \
-          -j"$build_jobs" O="$OUT" \
-          KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" \
-          CONFIG_FAKE_DISABLE="${CONFIG_FAKE_DISABLE:-}" Image 2>&1 | tee build.log
+        if "${build_command[@]}" "${build_args[@]}" Image 2>&1 | tee build.log; then
+          :
+        else
+          compile_status=${PIPESTATUS[0]}
+          if [ "$compile_status" -eq 124 ]; then
+            echo "::error::Diagnostic compilation reached its 38-minute limit. See the compilation log artifact."
+          fi
+          free -h
+          df -h "$PWD"
+          exit "$(( compile_status == 0 ? 1 : compile_status ))"
+        fi
         BUILD_END=$(date +%s)
         echo "BUILD_TIME=$((BUILD_END - BUILD_START))" >> "$GITHUB_ENV"
 
