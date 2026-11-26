@@ -100,6 +100,40 @@ match_category() {
   return 1
 }
 
+# These exclusions were verified in the original commit order on the OnePlus 6.6.118 tree.
+# Category and explicit-SHA filters can have different dependencies, so they use live checks.
+declare -A excluded_commits=()
+if [[ "${TOKENS[*]}" == all && "$EPIC_HEAD" == b81194ae4c6965d1b34f635e72c7f380c78d53bd ]] &&
+   [[ "$OP_MODEL" == OP13T || "$OP_MODEL" == OP13S ]]; then
+  profile=00
+  source_files=(Makefile kernel/sched/core.c mm/vmscan.c)
+  expected_blobs=(
+    83447398a568af4872642e5480ab1264ae3b0cc5
+    b49273faf0fdbf81d79767af466561aac8f99470
+    367549bafdf1b0616533c6143eb65c69403c8ec2
+  )
+  if [ -n "${SUSFS_PROTECTED_PATHS_FILE:-}" ]; then
+    profile=10
+    source_files+=(fs/namei.c)
+    expected_blobs+=(9d7f1d38102cf1cfc7dce5e8686324248ce78597)
+  fi
+  if [ -n "${BBR3_PROTECTED_PATHS_FILE:-}" ]; then
+    profile="${profile:0:1}1"
+    source_files+=(net/ipv4/tcp_bbr3.c)
+    expected_blobs+=(5e65b92bb7f1c50ce5b8730e2c056051ce41758a)
+  fi
+
+  if source_blobs=$(git -C "$KERNEL_DIR" hash-object --no-filters -- "${source_files[@]}" 2>/dev/null) &&
+     [[ "$source_blobs" == "$(printf '%s\n' "${expected_blobs[@]}")" ]]; then
+    exclusions_file="$(dirname -- "${BASH_SOURCE[0]}")/epicmann24-excluded-commits.tsv"
+    while IFS=$'\t' read -r commit profiles; do
+      if [[ "$commit" =~ ^[0-9a-f]{40}$ && ",$profiles," == *",$profile,"* ]]; then
+        excluded_commits["$commit"]=1
+      fi
+    done < "$exclusions_file"
+  fi
+fi
+
 SELECTED_COMMITS=()
 
 if [ "$ALL_EXPLICIT" = true ]; then
@@ -152,6 +186,9 @@ else
   fi
 
   for sha in "${ALL_COMMITS[@]}"; do
+    if [[ -n "${excluded_commits[$sha]+present}" ]]; then
+      continue
+    fi
     subj=$(git -C "$GIT_DIR" log -1 --format=%s "$sha")
     if grep -qiE '^(revert ")?((upstream|backport|fromgit|fromlist):|Linux 6\.6\.[0-9]+)|anykernel|localversion' <<< "$subj"; then
       echo "  [SKIP] ${sha:0:8} $subj"
@@ -232,7 +269,7 @@ for sha in "${SELECTED_COMMITS[@]}"; do
   pfile=$(printf "%s/%04d-%s.patch" "$PATCH_DIR" "$idx" "${sha:0:10}")
   idx=$((idx + 1))
 
-  git -C "$GIT_DIR" format-patch -1 "$sha" --stdout --no-renames -- . "${excluded_paths[@]}" > "$pfile"
+  git -C "$GIT_DIR" diff-tree --root --no-commit-id -r -p --no-renames "$sha" -- . "${excluded_paths[@]}" > "$pfile"
 
   if ! grep -q '^diff --git ' "$pfile"; then
     protected=$((protected + 1))
