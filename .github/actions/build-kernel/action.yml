@@ -131,6 +131,25 @@ runs:
         github_token: ${{ inputs.github_token }}
         debug: ${{ inputs.debug }}
 
+    - name: Record source sync diagnostics
+      if: ${{ inputs.debug == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          printf 'Source sync completed for %s\n' "$OP_MODEL"
+          free -h
+          df -h "$GITHUB_WORKSPACE"
+        } > "$RUNNER_TEMP/kernel-sync-diagnostics.txt"
+
+    - name: Upload source sync diagnostics
+      if: ${{ inputs.debug == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: sync-diagnostics-${{ env.OP_MODEL }}-${{ inputs.ksu_type }}
+        path: ${{ runner.temp }}/kernel-sync-diagnostics.txt
+        retention-days: 3
+
     - name: Set Dir Paths & Build Tools
       shell: bash
       run: |
@@ -729,6 +748,27 @@ runs:
         echo "NOMOUNT_VERSION=$NOMOUNT_TAG" >> "$GITHUB_ENV"
         printf 'NoMount %s (%s)\n' "$NOMOUNT_TAG" "$NOMOUNT_SHA" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
 
+    - name: Record patched source diagnostics
+      if: ${{ inputs.debug == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        {
+          printf 'Device: %s\nKernel: %s\nKernelSU: %s\nSUSFS: %s\nNoMount: %s\n' \
+            "$OP_MODEL" "$TKERNEL_VER" "$KSU_COMMIT_SHA" "${SUSVER:-off}" "${NOMOUNT_VERSION:-off}"
+          printf 'BBRv3 requested: %s\n' "${OP_BBR3:-false}"
+          free -h
+          df -h "$COMMON_KERNEL_FOLDER"
+        } > "$RUNNER_TEMP/kernel-source-diagnostics.txt"
+
+    - name: Upload patched source diagnostics
+      if: ${{ inputs.debug == 'true' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: source-diagnostics-${{ env.OP_MODEL }}-${{ inputs.ksu_type }}
+        path: ${{ runner.temp }}/kernel-source-diagnostics.txt
+        retention-days: 3
+
     - name: 🏷️ Customize Kernel Branding (6.6.xxx-android15-encoren)
       shell: bash
       run: |
@@ -857,6 +897,15 @@ runs:
             echo "::warning::Could not download patch_linux; Image left unpatched for KPM"
           fi
         fi
+
+    - name: Upload failed compilation log
+      if: ${{ failure() && steps.build_kernel_step.outcome == 'failure' }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: compile-log-${{ env.OP_MODEL }}-${{ inputs.ksu_type }}
+        path: ${{ env.COMMON_KERNEL_FOLDER }}/build.log
+        if-no-files-found: ignore
+        retention-days: 3
 
     - name: Save Build Metadata & Validate Image
       id: save_metadata
