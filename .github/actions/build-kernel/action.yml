@@ -584,6 +584,21 @@ runs:
           fi
         fi
 
+        # The overwriter generator embeds each newline-terminated record in C source.
+        python3 - <<'PY'
+        from pathlib import Path
+
+        config_dir = Path("drivers/of/overwriter/overwrite_configs")
+        for config in config_dir.rglob("*.conf"):
+            original = config.read_bytes()
+            normalized = original.replace(b"\r\n", b"\n")
+            if normalized and not normalized.endswith(b"\n"):
+                normalized += b"\n"
+            if normalized != original:
+                config.write_bytes(normalized)
+                print(f"Normalized overwriter config: {config}")
+        PY
+
         # Module overlay (с исправленным копированием модулей: -n вместо -z)
         OVERLAY_PATCH="$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/0001-module-Add-module-intercept-and-overlay-mechanism-${ANDROID_VER}-${KERNEL_VER}.patch"
         if apply_optional_patch "$OVERLAY_PATCH" -C2 && [ -d "$KERNEL_PATCHES_FOLDER/oneplus/module_overlay/modules" ]; then
