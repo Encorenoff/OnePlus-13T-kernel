@@ -8,13 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       op_model:
-        description: 'Устройство (последние исходники OnePlusOSS A16)'
+        description: 'Устройство или профиль прошивки'
         required: true
         type: choice
         options:
           - OP13T+OP13S
           - OP13T
           - OP13S
+          - OP13T-CPH2723-A17
         default: OP13T+OP13S
       ksu_variant:
         description: 'Вариант KernelSU (автоподбор последней версии)'
@@ -174,6 +175,7 @@ jobs:
             OP13T+OP13S) jq_filter='map(select(.model == "OP13T" or .model == "OP13S"))' ;;
             OP13T)       jq_filter='map(select(.model == "OP13T"))' ;;
             OP13S)       jq_filter='map(select(.model == "OP13S"))' ;;
+            OP13T-CPH2723-A17) jq_filter='map(select(.model == "OP13T-CPH2723-A17"))' ;;
             *)           echo "::error::Unknown model"; exit 1 ;;
           esac
 
@@ -199,7 +201,7 @@ jobs:
             })' > matrix.json
 
           count=$(jq 'length' matrix.json)
-          [ "$count" -gt 0 ] || { echo "::error::No matching configs in configs/a16/"; exit 1; }
+          [ "$count" -gt 0 ] || { echo "::error::No matching device config"; exit 1; }
           echo "count=$count" >> "$GITHUB_OUTPUT"
 
           pick_repo() {
@@ -475,7 +477,7 @@ jobs:
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           nomount_tag: ${{ needs.set-op-model.outputs.nomount_tag }}
           nomount_sha: ${{ needs.set-op-model.outputs.nomount_sha }}
-          epicmann_patches: ${{ inputs.epicmann_patches }}
+          epicmann_patches: ${{ inputs.epicmann_patches && matrix.stock_kernel_release == null }}
           epicmann_branch: ${{ inputs.epicmann_branch }}
           epicmann_filter: ${{ inputs.epicmann_filter }}
           enable_kpm: ${{ inputs.enable_kpm }}

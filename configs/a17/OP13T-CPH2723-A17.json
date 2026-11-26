@@ -1,0 +1,13 @@
+{
+  "model": "OP13T-CPH2723-A17",
+  "soc": "sun",
+  "branch": "wild/sm8750",
+  "manifest": "cph2723_17.0.1.201.xml",
+  "android_version": "android15",
+  "kernel_version": "6.6",
+  "os_version": "A17",
+  "stock_kernel_release": "6.6.118-android15-8-gc4127a25dcf3-ab15863337-4k",
+  "stock_module_abi": "configs/a17/CPH2723_17.0.1.201.module-abi",
+  "c_compiler": "kernel_platform/prebuilts/clang/host/linux-x86/clang-r510928/bin",
+  "disk_cleanup": false
+}

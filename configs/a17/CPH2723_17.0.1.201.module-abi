@@ -1,0 +1,10 @@
+# Symbol CRCs required by modules in CPH2723_17.0.1.201(EX01) vendor_dlkm.
+0x4e276f37 module_layout
+0xa9b03a93 wake_up_process
+0x454d3026 devm_clk_get
+0x01000e51 schedule
+0xc6040a84 __put_task_struct
+0x74661383 kmalloc_caches
+0x94c5c4a4 of_property_read_variable_u32_array
+0xf5ab7c57 platform_driver_unregister
+0x279498f1 __platform_driver_register

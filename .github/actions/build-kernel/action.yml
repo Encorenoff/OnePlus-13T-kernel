@@ -549,6 +549,7 @@ runs:
         sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
 
     - name: Apply OnePlus SM8750 Patches (HMBIRD, Module Overlay, Opt, NTSync, DS)
+      if: ${{ env.OP_STOCK_KERNEL_RELEASE == '' }}
       shell: bash
       run: |
         set -euo pipefail
@@ -784,11 +785,17 @@ runs:
         path: ${{ runner.temp }}/kernel-source-diagnostics.txt
         retention-days: 3
 
-    - name: 🏷️ Customize Kernel Branding (6.6.xxx-android15-encoren)
+    - name: Set Kernel Release
       shell: bash
       run: |
         set -euo pipefail
         CUSTOM_LOCALVERSION="-${ANDROID_VER}-${OP_UNAME}"
+        if [ -n "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
+          case "$OP_STOCK_KERNEL_RELEASE" in
+            "$TKERNEL_VER"-"$ANDROID_VER"-*) CUSTOM_LOCALVERSION="${OP_STOCK_KERNEL_RELEASE#"$TKERNEL_VER"}" ;;
+            *) echo "::error::Source version does not match $OP_STOCK_KERNEL_RELEASE"; exit 1 ;;
+          esac
+        fi
         echo "CUSTOM_LOCALVERSION=$CUSTOM_LOCALVERSION" >> "$GITHUB_ENV"
         echo "✅ Target kernel version string: ${TKERNEL_VER}${CUSTOM_LOCALVERSION}"
 
@@ -802,7 +809,7 @@ runs:
 
         WORKSPACE="${GITHUB_WORKSPACE}"
         KCFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=. -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument -D__ANDROID_COMMON_KERNEL__"
-        if [ "${{ inputs.mlgo }}" = "true" ]; then
+        if [ "${{ inputs.mlgo }}" = "true" ] && [ -z "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
           if printf 'int f(int a){return a+1;}\n' | clang --target=aarch64-linux-gnu -O2 -mllvm -regalloc-enable-advisor=release -x c - -c -o /dev/null 2>/dev/null; then
             KCFLAGS="$KCFLAGS -mllvm -regalloc-enable-advisor=release"
           fi
@@ -838,19 +845,28 @@ runs:
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" gki_defconfig
 
         scripts/config --file "$OUT/.config" --set-str LOCALVERSION "${CUSTOM_LOCALVERSION}"
-        scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO || true
-        sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion || true
-        sed -i 's/echo "-dirty"/echo ""/' scripts/setlocalversion || true
-
-        if [ "${{ inputs.optimize_level }}" = "O3" ]; then
-          scripts/config --file "$OUT/.config" -d CC_OPTIMIZE_FOR_PERFORMANCE -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
-          KCFLAGS_EXTRA="-mcpu=oryon-1 -O3"
+        if [ -n "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
+          # Restore the firmware's GKI settings for prebuilt vendor modules.
+          awk '/^[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]*$/ { print $1 }' \
+            android/abi_gki_aarch64 android/abi_gki_aarch64_* | LC_ALL=C sort -u > abi_symbollist.raw
+          scripts/config --file "$OUT/.config" -e LOCALVERSION_AUTO -e MODULE_SCMVERSION \
+            -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_NONE \
+            -e TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST abi_symbollist.raw
+          KCFLAGS_EXTRA=""
         else
-          scripts/config --file "$OUT/.config" -e CC_OPTIMIZE_FOR_PERFORMANCE -d CC_OPTIMIZE_FOR_PERFORMANCE_O3
-          KCFLAGS_EXTRA="-mcpu=oryon-1 -O2"
+          scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO || true
+          sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion || true
+          sed -i 's/echo "-dirty"/echo ""/' scripts/setlocalversion || true
+          if [ "${{ inputs.optimize_level }}" = "O3" ]; then
+            scripts/config --file "$OUT/.config" -d CC_OPTIMIZE_FOR_PERFORMANCE -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
+            KCFLAGS_EXTRA="-mcpu=oryon-1 -O3"
+          else
+            scripts/config --file "$OUT/.config" -e CC_OPTIMIZE_FOR_PERFORMANCE -d CC_OPTIMIZE_FOR_PERFORMANCE_O3
+            KCFLAGS_EXTRA="-mcpu=oryon-1 -O2"
+          fi
+          scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_FULL -e LTO_CLANG_THIN
         fi
 
-        scripts/config --file "$OUT/.config" -e LTO_CLANG -d LTO_CLANG_NONE -d LTO_CLANG_THIN -d LTO_CLANG_FULL -e LTO_CLANG_THIN
         if [ -n "${NOMOUNT_VERSION:-}" ]; then
           scripts/config --file "$OUT/.config" -e NOMOUNT
         fi
@@ -858,6 +874,15 @@ runs:
           scripts/config --file "$OUT/.config" -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -e TCP_CONG_BBR3
         fi
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" O="$OUT" olddefconfig
+        if [ -n "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
+          for config in CONFIG_ARM64_4K_PAGES CONFIG_GKI_DYNAMIC_TASK_STRUCT_SIZE CONFIG_LTO_NONE \
+                        CONFIG_MODVERSIONS CONFIG_MODULE_SCMVERSION CONFIG_TRIM_UNUSED_KSYMS; do
+            if ! grep -qxF "$config=y" "$OUT/.config"; then
+              echo "::error::$config=y is required by the CPH2723 kernel configuration"
+              exit 1
+            fi
+          done
+        fi
         if [ "${OP_BBR3:-false}" = "true" ] && ! grep -qxF 'CONFIG_TCP_CONG_BBR3=y' "$OUT/.config"; then
           echo "::error::CONFIG_TCP_CONG_BBR3=y is missing from the final kernel config"
           exit 1
@@ -872,7 +897,10 @@ runs:
         fi
 
         KCFLAGS="$KCFLAGS -Wno-error -pipe ${KCFLAGS_EXTRA}"
-        KCPPFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=. -DCONFIG_OPTIMIZE_INLINING"
+        KCPPFLAGS="-fdebug-prefix-map=${WORKSPACE}=. -fmacro-prefix-map=${WORKSPACE}=. -ffile-prefix-map=${WORKSPACE}=."
+        if [ -z "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
+          KCPPFLAGS+=" -DCONFIG_OPTIMIZE_INLINING"
+        fi
 
         BUILD_START=$(date +%s)
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" \
@@ -927,6 +955,27 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        if [ -n "${OP_STOCK_KERNEL_RELEASE:-}" ]; then
+          out="$COMMON_KERNEL_FOLDER/out"
+          if [ "$(cat "$out/include/config/kernel.release")" != "$OP_STOCK_KERNEL_RELEASE" ]; then
+            echo "::error::Kernel release differs from $OP_STOCK_KERNEL_RELEASE"
+            exit 1
+          fi
+          actual="$out/vmlinux.symvers"
+          expected="$GITHUB_WORKSPACE/action-source/$OP_STOCK_MODULE_ABI"
+          test -s "$actual"
+          awk '
+            NR == FNR { crc[$2] = $1; next }
+            NF && $1 !~ /^#/ {
+              seen++
+              if (crc[$2] != $1) {
+                printf "::error::Firmware ABI mismatch for %s (expected %s, got %s)\n", $2, $1, (crc[$2] ? crc[$2] : "missing")
+                failed = 1
+              }
+            }
+            END { if (failed || !seen) exit 1; printf "Verified %d firmware module symbol CRCs\n", seen }
+          ' "$actual" "$expected"
+        fi
         echo "kernel_version=${TKERNEL_VER}${CUSTOM_LOCALVERSION}" >> "$GITHUB_OUTPUT"
         echo "ksu_version=${KSUVER:-unknown}" >> "$GITHUB_OUTPUT"
         echo "ksu_type=${{ inputs.ksu_type }}" >> "$GITHUB_OUTPUT"
