@@ -521,7 +521,7 @@ runs:
         echo "CONFIG_BBG=y" >> common/arch/arm64/configs/gki_defconfig
         sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
 
-    - name: Apply OnePlus SM8750 Patches (HMBIRD, Module Overlay, Opt, NTSync, DS, Debloat)
+    - name: Apply OnePlus SM8750 Patches (HMBIRD, Module Overlay, Opt, NTSync, DS)
       shell: bash
       run: |
         set -euo pipefail
@@ -545,22 +545,15 @@ runs:
         }
 
         if [ "$OP_HMBIRD" = "true" ]; then
-          FENGCHI="$KERNEL_PATCHES_FOLDER/oneplus/hmbird/fengchi_${OP_MODEL}_${OP_OS_VERSION}.patch"
-          if [ -f "$FENGCHI" ]; then
-            HMBIRD_DIR="$KERNEL_PATCHES_FOLDER/oneplus/hmbird"
-            for hmbird_patch in "$FENGCHI" "$HMBIRD_DIR/overwriter.patch" "$HMBIRD_DIR/hmbird_config.patch"; do
-              if [ -f "$hmbird_patch" ]; then
-                dos2unix "$hmbird_patch"
-              fi
-            done
-            apply_optional_patch "$FENGCHI" -C2 || true
-            if [ ! -f drivers/of/overwriter/overwrite_config_loader.c ]; then
-              apply_optional_patch "$HMBIRD_DIR/overwriter.patch" -C2 || true
-            fi
-            if [ -f drivers/of/overwriter/overwrite_configs/convert_configs.sh ]; then
-              chmod +x drivers/of/overwriter/overwrite_configs/convert_configs.sh
-              apply_optional_patch "$HMBIRD_DIR/hmbird_config.patch" -C2 || true
-            fi
+          HMBIRD_DIR="$KERNEL_PATCHES_FOLDER/oneplus/hmbird"
+          if [ ! -f drivers/of/overwriter/overwrite_config_loader.c ] && [ -f "$HMBIRD_DIR/overwriter.patch" ]; then
+            dos2unix "$HMBIRD_DIR/overwriter.patch"
+            apply_optional_patch "$HMBIRD_DIR/overwriter.patch" -C2 || true
+          fi
+          if [ -f drivers/of/overwriter/overwrite_configs/convert_configs.sh ] && [ -f "$HMBIRD_DIR/hmbird_config.patch" ]; then
+            chmod +x drivers/of/overwriter/overwrite_configs/convert_configs.sh
+            dos2unix "$HMBIRD_DIR/hmbird_config.patch"
+            apply_optional_patch "$HMBIRD_DIR/hmbird_config.patch" -C2 || true
           fi
         fi
 
@@ -624,29 +617,30 @@ runs:
         fi
 
         if [ "$OP_OPT" = "true" ]; then
-          for p in optimized_mem_operations file_struct_8bytes_align reduce_cache_pressure mem_opt_prefetch \
-                   optimise_memcmp minimise_wakeup_time int_sqrt reduce_gc_thread_sleep_time \
-                   add_timeout_wakelocks_globally f2fs_reduce_congestion reduce_freeze_timeout \
-                   add_limitation_scaling_min_freq re_write_limitation_scaling_min_freq adjust_cpu_scan_order \
-                   avoid_extra_s2idle_wake_attempts disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks \
-                   increase_ext4_default_commit_age increase_sk_mem_packets reduce_pci_pme_wakeups \
-                   silence_irq_cpu_logspam silence_system_logspam use_unlikely_wrap_cpufreq; do
+          for p in file_struct_8bytes_align reduce_cache_pressure mem_opt_prefetch optimise_memcmp \
+                   int_sqrt reduce_gc_thread_sleep_time add_timeout_wakelocks_globally adjust_cpu_scan_order \
+                   disable_cache_hot_buddy f2fs_enlarge_min_fsync_blocks increase_ext4_default_commit_age \
+                   reduce_pci_pme_wakeups silence_irq_cpu_logspam silence_system_logspam; do
             apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/${p}.patch" -C2 || true
           done
-          CLEAR_PAGE_PATCH="$KERNEL_PATCHES_FOLDER/common/clear_page_16bytes_align.patch"
-          if [ -f "$CLEAR_PAGE_PATCH" ]; then
-            sed -e 's/SYM_FUNC_START_PI(clear_page)/SYM_FUNC_START_PI(__pi_clear_page)/' \
-              "$CLEAR_PAGE_PATCH" > "$RUNNER_TEMP/clear_page_16bytes_align.patch"
-            apply_optional_patch "$RUNNER_TEMP/clear_page_16bytes_align.patch" -C2 || true
-          fi
         fi
 
         if [ "$OP_NTSYNC" = "true" ]; then
           NTSYNC_DIR="$KERNEL_PATCHES_FOLDER/common/ntsync"
           NTSYNC_COMPAT="$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}.patch"
           [ -f "$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}_${OP_OS_VERSION}.patch" ] && NTSYNC_COMPAT="$NTSYNC_DIR/ntsync_compat_${ANDROID_VER}-${KERNEL_VER}_${OP_OS_VERSION}.patch"
-          if apply_optional_patch "$NTSYNC_COMPAT" -C2 && apply_optional_patch "$NTSYNC_DIR/ntsync_base.patch" -C2; then
-            scripts/config --file arch/arm64/configs/gki_defconfig -e NTSYNC
+          if [ ! -f drivers/misc/ntsync.c ]; then
+            apply_optional_patch "$NTSYNC_DIR/ntsync_base.patch" -C2 || true
+          fi
+          if [ -f drivers/misc/ntsync.c ] && [ -f include/uapi/linux/ntsync.h ]; then
+            if ! grep -qxF 'config NTSYNC' drivers/misc/Kconfig ||
+               ! grep -qF '$(CONFIG_NTSYNC)' drivers/misc/Makefile; then
+              apply_optional_patch "$NTSYNC_COMPAT" -C2 || true
+            fi
+            if grep -qxF 'config NTSYNC' drivers/misc/Kconfig &&
+               grep -qF '$(CONFIG_NTSYNC)' drivers/misc/Makefile; then
+              scripts/config --file arch/arm64/configs/gki_defconfig -e NTSYNC
+            fi
           fi
         fi
 
@@ -655,7 +649,6 @@ runs:
         fi
 
         if [ "$OP_DS" = "true" ]; then
-          apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/droidspaces/fix_sysvipc_kabi_6_7_8.patch" -C2 || true
           apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Return-ghost-task-if-task-is-null-and-is-requested-b.patch" -C2 || true
           cat >> arch/arm64/configs/gki_defconfig <<EOF
         CONFIG_SYSVIPC=y
@@ -701,10 +694,6 @@ runs:
 
         if apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/fake_config.patch" -C2; then
           echo "CONFIG_FAKE_DISABLE=CONFIG_TCP_CONG_ADVANCED CONFIG_IP6_NF_NAT" >> "$GITHUB_ENV"
-        fi
-        if apply_optional_patch "$KERNEL_PATCHES_FOLDER/common/vendor_modules/0001-Support-conditional-vendor-modules-blacklisting-6.1-and-above.patch" -C2; then
-          scripts/config --file arch/arm64/configs/gki_defconfig --set-str DEBLOAT_VENDOR_MODULES \
-            "${OP_BLACKLIST_MODULES},oplus_network_tuning,oplus_networks_tuning"
         fi
 
     - name: Integrate NoMount into the kernel

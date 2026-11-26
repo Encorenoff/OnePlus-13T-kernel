@@ -72,7 +72,7 @@ on:
         type: boolean
         default: true
       enable_hmbird:
-        description: 'Патч HMBIRD SCX (Fengchi)'
+        description: 'Конфигурация HMBIRD и загрузчик настроек'
         required: false
         type: boolean
         default: true
