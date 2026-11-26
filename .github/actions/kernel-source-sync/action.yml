@@ -42,13 +42,16 @@ runs:
         import xml.etree.ElementTree as ET
         import subprocess
         import os, shutil
+        import tempfile
         import time
+        from shlex import quote
         import glob
         from concurrent.futures import ThreadPoolExecutor
         import requests
         
-        MAX_WORKERS = (os.cpu_count() or 2) * 4
-        NPROC = int(subprocess.check_output("nproc", shell=True).strip())
+        MAX_WORKERS = 2
+        NPROC = min(2, int(subprocess.check_output("nproc", shell=True).strip()))
+        TEMP_DIR = os.environ["RUNNER_TEMP"]
         TARGET_REPO = "${{ github.repository }}"
         TOOLCHAIN_MAP = {
             "clang/host/linux-x86": "clang",
@@ -83,10 +86,8 @@ runs:
             start_time = time.time()
             MAX_ATTEMPTS = 3
             for attempt in range(1, MAX_ATTEMPTS + 1):
-                shm_workspace = f"/dev/shm/sync_{hash(name) % 1000000}"
-                if os.path.exists(shm_workspace):
-                    shutil.rmtree(shm_workspace, ignore_errors=True)
-                os.makedirs(shm_workspace, exist_ok=True)
+                archive_workspace = tempfile.mkdtemp(prefix="kernel-sync-", dir=TEMP_DIR)
+                archive_dir = quote(archive_workspace)
                 
                 print(f"Syncing: {name} -> {path}")
                 print(f"  [PENDING] {name}")
@@ -102,10 +103,10 @@ runs:
                         base_filename = f"{label}-{rev}.tar.gz"
                         BASE_URL = f"https://github.com/{TARGET_REPO}/releases/download/toolchain-cache"
                         
-                        check_single = f"curl -IsL {curl_headers} --retry 10 --connect-timeout 30 -o /dev/null -w '%{{http_code}}' {BASE_URL}/{base_filename}"
+                        check_single = f"curl -IsL {curl_headers} --retry 2 --retry-max-time 45 --connect-timeout 10 --max-time 25 -o /dev/null -w '%{{http_code}}' {BASE_URL}/{base_filename}"
                         if subprocess.check_output(check_single, shell=True).decode().strip() == "200":
                             if DEBUG: print(f"  [CACHE] Downloading single file: {base_filename}")
-                            aria_cmd = f"aria2c -x16 -s16 -k1M -j16 --retry-wait=5 --max-tries=10 -d {shm_workspace} --file-allocation=none {aria_quiet_flags} {aria2_headers} -o {base_filename} {BASE_URL}/{base_filename}"
+                            aria_cmd = f"timeout 6m aria2c -x4 -s4 -k1M -j2 --retry-wait=5 --max-tries=10 -d {archive_dir} --file-allocation=none {aria_quiet_flags} {aria2_headers} -o {base_filename} {BASE_URL}/{base_filename}"
                             subprocess.run(aria_cmd, shell=True, check=True, capture_output=not DEBUG)
                             found_in_cache = True
                         else:
@@ -113,7 +114,7 @@ runs:
                             parts_to_download = []
                             for suffix in [f"a{c}" for c in "abcdefghijklmnopqrstuvwxyz"]:
                                 part_name = f"{base_filename}.part{suffix}"
-                                check_part = f"curl -IsL {curl_headers} --retry 10 --connect-timeout 30 -o /dev/null -w '%{{http_code}}' {BASE_URL}/{part_name}"
+                                check_part = f"curl -IsL {curl_headers} --retry 2 --retry-max-time 45 --connect-timeout 10 --max-time 25 -o /dev/null -w '%{{http_code}}' {BASE_URL}/{part_name}"
                                 if subprocess.check_output(check_part, shell=True).decode().strip() == "200":
                                     parts_to_download.append(f"{BASE_URL}/{part_name}")
                                 else:
@@ -130,7 +131,7 @@ runs:
                                         f.write(f"{part_url}\n  out={p_name}\n")
                                 
                                 aria_bulk_cmd = (
-                                    f"aria2c -x16 -s16 -k1M -j16 --retry-wait=5 --max-tries=10 -d {shm_workspace} --file-allocation=none "
+                                    f"timeout 6m aria2c -x4 -s4 -k1M -j2 --retry-wait=5 --max-tries=10 -d {archive_dir} --file-allocation=none "
                                     f"{aria_quiet_flags} {aria2_headers} "
                                     f"--input-file={input_file_path}"
                                 )
@@ -143,14 +144,15 @@ runs:
                             print(f"::warning::Toolchain {base_filename} not found in release cache; falling back to direct download...")
                     
                     if found_in_cache:
-                        parts = sorted(glob.glob(os.path.join(shm_workspace, f"*.part*")))
-                        source = f"cat {' '.join(parts)} | " if parts else f"cat {os.path.join(shm_workspace, base_filename)} | "
+                        parts = sorted(glob.glob(os.path.join(archive_workspace, "*.part*")))
+                        archive_files = parts or [os.path.join(archive_workspace, base_filename)]
+                        source = f"cat {' '.join(map(quote, archive_files))} | "
                         extract_cmd = f"{source} tar -I 'pigz -p {NPROC} -b 256' -x --record-size=1M --no-same-owner -C {path} {strip}"
                         subprocess.run(extract_cmd, shell=True, check=True)
                     else:
                         direct_file = f"dynamic_file.tar.gz"
-                        archive_path = os.path.join(shm_workspace, direct_file)
-                        aria_cmd = f"aria2c -x16 -s16 -k1M -j16 --allow-overwrite=true --retry-wait=5 --max-tries=10 -d {shm_workspace} -o {direct_file} {aria_quiet_flags} {aria2_headers} '{url}'"
+                        archive_path = quote(os.path.join(archive_workspace, direct_file))
+                        aria_cmd = f"timeout 6m aria2c -x4 -s4 -k1M -j2 --allow-overwrite=true --retry-wait=5 --max-tries=10 -d {archive_dir} -o {direct_file} {aria_quiet_flags} {aria2_headers} '{url}'"
                         if DEBUG: print(f"  [DIRECT] Fetching: {url}")
                         subprocess.run(aria_cmd, shell=True, check=True, capture_output=not DEBUG)
                         extract_cmd = f"tar -I 'pigz -p {NPROC} -b 256' -x --record-size=1M -f {archive_path} -C {path} {strip}"
@@ -171,8 +173,7 @@ runs:
                     if attempt < MAX_ATTEMPTS:
                         time.sleep(5)
                 finally:
-                    if os.path.exists(shm_workspace):
-                        shutil.rmtree(shm_workspace, ignore_errors=True)
+                    shutil.rmtree(archive_workspace, ignore_errors=True)
             return False
         
         global_start = time.time()
@@ -219,7 +220,8 @@ runs:
                     post_process_data.append((path, child))
         
         if DEBUG:
-            print(f"Starting parallel sync of {len(sync_tasks)} projects...")
+            print(f"Syncing {len(sync_tasks)} projects, up to {MAX_WORKERS} at a time")
+        subprocess.run(["df", "-h", TEMP_DIR, top_dir], check=True)
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             success_list = list(executor.map(sync_project, sync_tasks))
             

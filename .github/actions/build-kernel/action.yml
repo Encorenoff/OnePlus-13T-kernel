@@ -121,6 +121,7 @@ runs:
         echo "CONFIG=$OP_MODEL" >> "$GITHUB_ENV"
         git config --global feature.manyFiles true
         git config --global pack.sparse true
+        git config --global pack.threads 2
         git config --global http.sslVerify false
 
     - name: Sync Kernel Source (OnePlus 13T / 13S latest)
@@ -186,7 +187,7 @@ runs:
         if [ -n "${OP_ZYC_COMPILER:-}" ]; then
           ZYC_DIR="$CONFIG_FOLDER/compiler/zyc"
           mkdir -p "$ZYC_DIR"
-          curl -L --fail --retry 5 --retry-delay 5 -o "$CONFIG_FOLDER/compiler.tar.gz" "$OP_ZYC_COMPILER"
+          curl -L --fail --retry 3 --retry-max-time 360 --connect-timeout 20 --max-time 180 -o "$CONFIG_FOLDER/compiler.tar.gz" "$OP_ZYC_COMPILER"
           tar -xzf "$CONFIG_FOLDER/compiler.tar.gz" -C "$ZYC_DIR"
           rm -f "$CONFIG_FOLDER/compiler.tar.gz"
           [ -x "$ZYC_DIR/bin/clang" ] && CLANG_BIN="$ZYC_DIR/bin"
@@ -332,10 +333,14 @@ runs:
         [ -z "$KSU_REPO" ] && KSU_REPO="KernelSU-Next/KernelSU-Next"
         KSU_INPUT="${{ inputs.ksu_branch_or_hash }}"
         KSU_REF="${KSU_INPUT:-dev}"
-        (curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
-          || curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/${KSU_REPO}/next/kernel/setup.sh" \
-          || curl --fail --location --proto '=https' -LSs "https://raw.githubusercontent.com/${KSU_REPO}/dev/kernel/setup.sh") \
-          | bash -s "$KSU_REF"
+        curl --fail --location --proto '=https' --retry 3 --connect-timeout 10 --max-time 45 -sS \
+          "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
+          -o "$RUNNER_TEMP/ksun-setup.sh"
+        bash "$RUNNER_TEMP/ksun-setup.sh" "$KSU_REF"
+        if [[ "$KSU_REF" =~ ^[a-f0-9]{40}$ ]] && [ "$(git -C "$KSUN_FOLDER" rev-parse HEAD)" != "$KSU_REF" ]; then
+          echo "::error::KernelSU Next checkout does not match $KSU_REF"
+          exit 1
+        fi
         cd "$KSUN_FOLDER/kernel"
         COMMITS_COUNT=$(git rev-list --count HEAD)
         BASE_VERSION=30000
@@ -371,8 +376,11 @@ runs:
         echo "$susfs_version" >> "${ARTIFACTS_FOLDER}/${OP_MODEL}_${OP_OS_VERSION}.txt"
         echo "✅ SUSFS Version: $susfs_version"
 
-        if grep -q "config KSU_SUSFS" "$KSU_FOLDER/kernel/Kconfig" 2>/dev/null; then
-          echo "ℹ️ ${KSU_FOLDER} уже содержит нативную интеграцию SUSFS — пропускаем 10_enable_susfs_for_ksu.patch"
+        if grep -qxF 'config KSU_SUSFS' "$KSU_FOLDER/kernel/Kconfig"; then
+          echo "KernelSU source already supports built-in SUSFS"
+        elif [ "${{ inputs.ksu_type }}" = "KSUN" ]; then
+          echo "::error::This KernelSU Next revision lacks built-in SUSFS support. Use a dev-susfs revision for this build."
+          exit 1
         else
           cd "$KSU_FOLDER"
           patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
@@ -755,9 +763,18 @@ runs:
         export KBUILD_BUILD_TIMESTAMP="${{ inputs.build_timestamp }}"
         [ -z "$KBUILD_BUILD_TIMESTAMP" ] && export KBUILD_BUILD_TIMESTAMP="$(date -u)"
 
+        build_jobs=$(nproc)
+        memory_jobs=$(awk '/^MemAvailable:/ { print int($2 / (2 * 1024 * 1024)) }' /proc/meminfo)
+        build_jobs=$(( build_jobs < memory_jobs ? build_jobs : memory_jobs ))
+        build_jobs=$(( build_jobs > 0 ? build_jobs : 1 ))
+        export THINLTO_JOBS=$(( build_jobs < 2 ? build_jobs : 2 ))
+        printf 'Build workers: %s, ThinLTO workers: %s\n' "$build_jobs" "$THINLTO_JOBS"
+        free -h
+        df -h "$PWD"
+
         cat << 'LDW' > "$COMMON_KERNEL_FOLDER/ld-wrapper"
         #!/bin/bash
-        ld.lld "$@" --thinlto-jobs=$(nproc --all)
+        exec ld.lld "$@" --thinlto-jobs="$THINLTO_JOBS"
         LDW
         chmod +x "$COMMON_KERNEL_FOLDER/ld-wrapper"
 
@@ -804,7 +821,7 @@ runs:
 
         BUILD_START=$(date +%s)
         make LD="$COMMON_KERNEL_FOLDER/ld-wrapper" HOSTLD="$COMMON_KERNEL_FOLDER/ld-wrapper" \
-          -j"$(nproc --all)" O="$OUT" \
+          -j"$build_jobs" O="$OUT" \
           KCFLAGS="$KCFLAGS" KCPPFLAGS="$KCPPFLAGS" \
           CONFIG_FAKE_DISABLE="${CONFIG_FAKE_DISABLE:-}" Image 2>&1 | tee build.log
         BUILD_END=$(date +%s)

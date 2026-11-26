@@ -225,7 +225,11 @@ jobs:
                 full_repo=$(pick_repo "SukiSU-Nova/SukiSU-Nova" "SukiSU-Ultra/SukiSU-Ultra") || { echo "::error::SukiSU Nova/Ultra repo not found" >&2; exit 1; }
                 ;;
               KSUN)
-                full_repo=$(pick_repo "KernelSU-Next/KernelSU-Next") || { echo "::error::KernelSU-Next repo not found" >&2; exit 1; }
+                if [ "${{ inputs.susfs_enable }}" = "true" ]; then
+                  full_repo="pershoot/KernelSU-Next"
+                else
+                  full_repo="KernelSU-Next/KernelSU-Next"
+                fi
                 ;;
               *)
                 echo "::error::Unsupported KSU variant: $ktype" >&2; exit 1
@@ -236,7 +240,9 @@ jobs:
               ref="$custom_ref"
             else
               if [ "$ktype" = "KSUN" ]; then
-                if gh api "repos/${full_repo}/branches/dev" --jq '.name' >/dev/null 2>&1; then
+                if [ "$full_repo" = "pershoot/KernelSU-Next" ]; then
+                  ref="dev-susfs"
+                elif gh api "repos/${full_repo}/branches/dev" --jq '.name' >/dev/null 2>&1; then
                   ref="dev"
                 else
                   ref=$(gh api "repos/${full_repo}" --jq '.default_branch')
